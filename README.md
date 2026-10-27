@@ -7,7 +7,7 @@ A tiny header-only library that makes [spdlog](https://github.com/gabime/spdlog)
 - **Minimal on the user side**: one line to get started, everything else is plain spdlog API
 - Built on spdlog's official extension point `custom_flag_formatter` (`%*` in the pattern is the simulation time)
 
-## Quick start (SystemC)
+## Quick start
 
 ```cpp
 #include <simlog/simlog.h>
@@ -84,7 +84,7 @@ cannot be overridden through the environment.
 ### Per-module levels
 
 ```bash
-SIMLOG_LEVEL="*=debug,dma=info"     # everything debug, except module "dma" at info
+SIMLOG_LEVEL="*=debug,dma=info"    # everything debug, except module "dma" at info
 SIMLOG_LEVEL="info"                # simply the global level
 ```
 
@@ -122,7 +122,7 @@ simlog::get(name)          ← lazy factory: create native logger + attach forma
 - **Single header**: the whole implementation is in `simlog.h`, which includes `<systemc>`
   unconditionally
 
-## Known limitations (phase 1)
+## Known limitations
 
 - **Synchronous loggers only**: an async logger calls `format()` on a background thread, so the
   stamp would be the time of output rather than the time of the log call
