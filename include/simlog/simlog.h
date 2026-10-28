@@ -1,30 +1,50 @@
-// simlog/simlog.h — spdlog extension for EDA simulation-time stamps (single header)
+// simlog/simlog.h — spdlog extension for EDA simulation-time stamps
 //
-// There is exactly one time source: SystemC. The stamp value is
-//   sc_time_stamp().value() × resolution multiplier
-// and the unit is always the resolution's base symbol (fs/ps/ns/us/ms/s).
+// The stamp is always "tick count × resolution multiplier" plus a plain unit
+// symbol (fs/ps/ns/us/ms/s). Where the ticks come from is decided by exactly one
+// compile-time backend:
+//
+//   SIMLOG_BACKEND_SVDPI    (default) the simulator's own time, read through the
+//                           DPI time API (IEEE 1800-2023 svGetTime /
+//                           svGetTimePrecision) or through the VPI/PLI fallback
+//                           (vpi_get_time / tf_gettimeprecision) on older
+//                           simulators. Compiled backend: its implementation is
+//                           src/simlog.cpp → libsimlog.so, so this header never
+//                           sees <svdpi.h> or a simulator declaration.
+//   SIMLOG_BACKEND_SYSTEMC  SystemC: sc_time_stamp().value() ×
+//                           sc_get_time_resolution(). Header-only, includes
+//                           <systemc>, so SystemC's include path is needed.
+//
+// Define one of the two macros to pick the backend (xmake: --backend=...). The
+// SVDPI default means DPI-C code needs no define at all; defining both is an
+// #error. Nothing else depends on the choice: the backends answer the same two
+// questions (now_ticks(), resolution_unit()) and everything else — the %* flag,
+// the pattern, the levels, the default sink, simlog::get() — is shared.
 // No initialization call of any kind is needed.
 //
-// Requires C++17. Note: this header includes <systemc> unconditionally, so
-// SystemC's include directory must be on the include path wherever simlog is
-// used.
+// The only public API is simlog::get(); everything else lives in simlog::detail.
+// Single-threaded model (an EDA simulation runs on the main thread only): no
+// locks, no atomics. Everything here is inline, so any translation unit may
+// include the header; only the SVDPI implementation lives in src/simlog.cpp.
+// Time is read inside the flag's format() call, never cached, so the stamp is
+// always the time of the log call. Levels are resolved once, at logger creation.
 //
-// The only public API is simlog::get(). Everything else (time flag / formatter /
-// environment parsing / default sink) lives in simlog::detail.
-//
-// Design notes (single-threaded model — an EDA simulation runs on the main
-// thread only, so there are no locks and no atomics):
-//   - Everything is header-only inline variables/functions, so any translation
-//     unit can include it without ODR problems
-//   - Time is read inside the flag's format() call, so there is no "call
-//     init() first" ordering constraint and the stamp is always the time of the
-//     log call
-//   - Levels are resolved once per logger, at creation; time-source changes
-//     (e.g. sc_set_time_resolution()) apply to every existing logger at once
+// Requires C++17.
 #pragma once
 
 #if __cplusplus < 201703L
 #error "simlog requires C++17 or later"
+#endif
+
+// ── Backend selection ────────────────────────────────────────────────
+// The two backends are strictly alternative: one time source each, chosen when
+// the code is compiled. SVDPI is the default, so the common case (a DPI-C
+// library) needs no defines; the SystemC backend has to be asked for.
+#if !defined(SIMLOG_BACKEND_SVDPI) && !defined(SIMLOG_BACKEND_SYSTEMC)
+#define SIMLOG_BACKEND_SVDPI 1
+#endif
+#if defined(SIMLOG_BACKEND_SVDPI) && defined(SIMLOG_BACKEND_SYSTEMC)
+#error "simlog: define at most one of SIMLOG_BACKEND_SVDPI and SIMLOG_BACKEND_SYSTEMC"
 #endif
 
 #include <spdlog/common.h>
@@ -42,31 +62,31 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <systemc>
 #include <utility>
 #include <vector>
+
+#if defined(SIMLOG_BACKEND_SYSTEMC)
+#include <systemc>
+#endif  // SIMLOG_BACKEND_SYSTEMC
 
 namespace simlog::detail {
 
 // ══════════════════════════════════════════════════════════════════════
 // 1. Global configuration: log levels
 //
-// Levels are pure run-time knobs with a single entry point: the environment.
-// There is deliberately no set_level()-style API, to avoid two sources of
-// truth ("half configured through the API, half through the environment").
-//
-// SIMLOG_LEVEL carries both the global level and the per-module overrides; the
-// form is detected automatically:
+// Levels have exactly one entry point, the environment — there is deliberately
+// no set_level()-style API (that would be two sources of truth). SIMLOG_LEVEL
+// carries both the global level and the per-module overrides; the form is
+// detected automatically:
 //
 //   SIMLOG_LEVEL=info                 # a bare level name sets the global level
 //   SIMLOG_LEVEL="*=debug,dma=info"   # module=level rules, ',' separated
 //
 // '*' matches any sequence of characters (including none), so a lone "*" is the
-// global rule and a partial wildcard such as "dma*" or "*_tb" narrows it. The
-// most specific matching rule wins: an exact name beats any wildcard, among
-// wildcards the one with more literal characters wins, and ties go to the rule
-// written later. Hence "*=debug,dma=info" logs "dma" at info and every other
-// module at debug, no matter in which order the two rules appear.
+// global rule and "dma*" / "*_tb" narrow it. The most specific matching rule
+// wins: an exact name beats any wildcard, then more literal characters, then the
+// rule written later — so "*=debug,dma=info" logs "dma" at info and everything
+// else at debug, in either order.
 //
 // The variable is read once, on the first simlog::get().
 // ══════════════════════════════════════════════════════════════════════
@@ -84,8 +104,8 @@ struct env_config {
 };
 
 // Rejected settings are reported on stderr instead of being applied silently.
-// Writes to stderr directly: an invalid setting must not throw or allocate its
-// way into a logging recursion.
+// fprintf directly: an invalid setting must not allocate its way into a logging
+// recursion.
 inline void warn_bad_entry(std::string_view entry) {
   std::fprintf(stderr,
                "[simlog] ignoring SIMLOG_LEVEL entry \"%.*s\" "
@@ -162,9 +182,9 @@ inline void warn_bad_entry(std::string_view entry) {
 }
 
 // "module=level,module=level,..." — only ',' separates; entries are used
-// verbatim, empty entries are skipped and invalid entries (bad shape, embedded
+// verbatim, empty entries are skipped, invalid ones (bad shape, embedded
 // whitespace, unknown level) are reported and skipped, so those modules fall back
-// to the global level just like unmatched modules do.
+// to the global level like unmatched modules do.
 inline void parse_modules(std::string_view list, std::vector<module_level>& modules) {
   while (!list.empty()) {
     const auto comma = list.find(',');
@@ -195,9 +215,8 @@ inline void parse_config(std::string_view value, env_config& cfg) {
   parse_modules(value, cfg.modules);
 }
 
-// Read once, lazily, on first use. The function-local static keeps the read out
-// of static-initialization order and avoids touching the environment before a
-// simulation exists.
+// Read once, lazily, on first use: the function-local static keeps the read out
+// of static-initialization order.
 [[nodiscard]] inline const env_config& env() {
   static const env_config cfg = [] {
     env_config c;
@@ -231,46 +250,91 @@ inline void parse_config(std::string_view value, env_config& cfg) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 2. SystemC time source (the only stamp source: no injection, no manual
-//    time advancement, no unit configuration)
+// 2. Simulation-time source — exactly one, from the selected backend
 //
-// A resolution may carry a multiplier (e.g. 100 fs = 100 fs per tick). The
-// multiplier is folded into the number and the unit keeps only the base
-// symbol: at 100 fs resolution, 12340 ticks print as "1234000 fs" rather than
-// "12340 100fs" — the unit column always holds a plain symbol such as
-// fs/ps/ns/us/ms/s. As a result sc_set_time_resolution() takes effect for this
-// library immediately, and all arithmetic stays integral with no floating-point
-// error.
+// Both backends answer the same two questions and nothing outside this section
+// knows which one is active:
+//   now_ticks()        integer tick count of the current simulation time
+//   resolution_unit()  {multiplier, base unit symbol} of one tick
+//
+// The multiplier is folded into the number and the unit keeps only the base
+// symbol (100 fs resolution, 12340 ticks → "1234000 fs", never "12340 100fs"),
+// so all arithmetic is integral and the stamp has no floating-point error.
 // ══════════════════════════════════════════════════════════════════════
 
-// Current simulation tick (1 tick = 1 time resolution). During elaboration
-// sc_time_stamp() is 0, which is fine.
-[[nodiscard]] inline std::uint64_t now_ticks() {
-  return static_cast<std::uint64_t>(sc_core::sc_time_stamp().value());
-}
-
-// Display form of the resolution: how many base units one tick is, plus the
-// base unit symbol. The symbol comes from SystemC itself (SystemC 3.0 may even
-// go down to as/zs/ys) and is printed verbatim.
+// Display form of one time resolution: how many base units one tick is, plus the
+// base unit symbol. Shared by both backends (and the contract the %* flag sees).
 struct unit_scale {
   std::uint64_t scale;  // 1 tick = scale × symbol
   const char* symbol;   // "fs" / "ps" / "ns" / "us" / "ms" / "s" etc.
 };
 
+#if defined(SIMLOG_BACKEND_SYSTEMC)
+
+// ── Backend: SystemC ─────────────────────────────────────────────────
+
+// Current simulation tick (1 tick = 1 time resolution). During elaboration
+// sc_time_stamp() is 0, which is fine and is not an error.
+[[nodiscard]] inline std::uint64_t now_ticks() {
+  return static_cast<std::uint64_t>(sc_core::sc_time_stamp().value());
+}
+
 // sc_get_time_resolution().value() is always 1 (a resolution measured in
 // itself), so the multiplier and the base unit are read in normalized form via
 // sc_time_tuple:
 //   1 fs → {1,"fs"}   100 fs → {100,"fs"}   10 ns → {10,"ns"}
-// SystemC only accepts resolutions of 1/10/100 × unit (otherwise E514), hence
-// scale ≤ 100.
+// The symbol comes from SystemC itself (SystemC 3.0 may even go down to
+// as/zs/ys) and is printed verbatim. SystemC only accepts resolutions of
+// 1/10/100 × unit (otherwise E514), hence scale ≤ 100.
 [[nodiscard]] inline unit_scale resolution_unit() {
   const sc_core::sc_time_tuple t(sc_core::sc_get_time_resolution());
   return {static_cast<std::uint64_t>(t.value()), t.unit_symbol()};
 }
 
-// Tick count × multiplier. Use 128-bit arithmetic when available: 64 bits
-// overflows above ~1.8e17 ticks (scale=100), whereas 128 bits is exact for any
-// uint64 tick count.
+#else  // SIMLOG_BACKEND_SVDPI
+
+// ── Backend: SVDPI (SystemVerilog DPI-C) ─────────────────────────────
+//
+// The implementation is src/simlog.cpp, built as libsimlog.so (the `simlog`
+// target, SVDPI configuration only). That split keeps this header free of the
+// simulator — no <svdpi.h>, no VPI/PLI declaration, no `<vpi_user.h>` /
+// `<veriuser.h>` conflict in user code — at the price of not being header-only:
+// whoever uses this backend links src/simlog.cpp, either as libsimlog.so or
+// compiled into the DPI-C library that also holds the logging code. One shared
+// object is one library state (registry, default sink, SIMLOG_LEVEL snapshot), so
+// hold exactly one copy.
+//
+// The two functions below are the entire contract between this header (the %*
+// flag, the pattern) and the backend (the clock); `extern "C"` because they are
+// what the shared library exports. src/simlog.cpp asks the simulator through the
+// DPI time API and falls back to the VPI/PLI functions, both as weak references; a
+// host that answers neither keeps the stamp at 0 and says so once on stderr.
+
+extern "C" {
+
+// Current simulation tick, in units of the simulation precision (0 when no API
+// reports a time, e.g. in a host-side program without a simulator).
+[[nodiscard]] std::uint64_t simlog_sv_now_ticks();
+
+// Display form of the current simulation precision: {multiplier, base symbol}.
+[[nodiscard]] unit_scale simlog_sv_resolution_unit();
+
+}  // extern "C"
+
+// What the shared code (and the tests) see: one call per use, no caching — the
+// stamp is the time of the log call, never a value read ahead of it.
+[[nodiscard]] inline std::uint64_t now_ticks() {
+  return simlog_sv_now_ticks();
+}
+[[nodiscard]] inline unit_scale resolution_unit() {
+  return simlog_sv_resolution_unit();
+}
+
+#endif  // SIMLOG_BACKEND_SYSTEMC
+
+// Tick count × multiplier — backend independent. Use 128-bit arithmetic when
+// available: 64 bits overflows above ~1.8e17 ticks (scale=100), whereas 128 bits
+// is exact for any uint64 tick count.
 #if defined(__SIZEOF_INT128__)
 using wide_ticks = unsigned __int128;
 #else
@@ -284,21 +348,18 @@ using wide_ticks = std::uint64_t;  // no 128-bit type: only extreme tick counts 
 // ══════════════════════════════════════════════════════════════════════
 // 3. Simulation-time pattern flag (%*)
 //
-// Built on spdlog's official extension point custom_flag_formatter (three
-// requirements: format() / clone() / a sensible flag character). The flag
-// character %* is a non-alphabetic character, so it cannot silently collide
-// with a built-in flag.
+// Built on spdlog's extension point custom_flag_formatter. The flag character
+// %* is non-alphabetic, so it cannot collide with a built-in flag.
 //
-// Output form (fixed width, easy to grep/diff): tick count × multiplier +
-// base unit symbol, right-aligned in 12 columns:
+// Output form (fixed width, easy to grep/diff): tick count × multiplier + base
+// unit symbol, right-aligned in 12 columns:
 //   [       12340 ps]   ← 1 ps resolution, i.e. 12.34 ns
 //   [       12340 ns]   ← 1 ns resolution
 //   [     1234000 fs]   ← 100 fs resolution (12340 tick × 100 fs = 1.234 ns)
 //
-// Known limitation (phase 1): a spdlog async logger runs format() on a
-// background thread, so the stamp is the time of output rather than the time of
-// the log call and would be inaccurate — only synchronous loggers are
-// supported.
+// Known limitation: a spdlog async logger runs format() on a background thread,
+// so the stamp would be the time of output rather than of the log call — only
+// synchronous loggers are supported.
 // ══════════════════════════════════════════════════════════════════════
 
 class sim_time_flag final : public spdlog::custom_flag_formatter {
@@ -351,12 +412,9 @@ namespace simlog {
 //                 directly by spdlog::get(), untouched
 //
 // The result is a native spdlog::logger, so callers are free to add_sink /
-// set_level. Single-threaded model: the registration path takes no lock and the
-// default sink is the single-threaded variant (_st).
-//
-// The name is taken as std::string (not std::string_view) because spdlog's
-// registry only accepts std::string: a view would force an allocation on every
-// call, including the registered-logger fast path.
+// set_level. The name is std::string (not string_view) because spdlog's registry
+// only accepts std::string: a view would force an allocation even on the
+// registered-logger fast path.
 // ══════════════════════════════════════════════════════════════════════
 
 [[nodiscard]] inline std::shared_ptr<spdlog::logger> get(const std::string& name) {

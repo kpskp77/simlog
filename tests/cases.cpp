@@ -1,35 +1,26 @@
-// Unit and integration tests for simlog.
+// The scenario bodies shared by both backends (see cases.h for the contract).
 //
-// The binary takes a scenario name as its only argument; `xmake test` runs it
-// once per scenario (see add_tests() in xmake.lua) so that every scenario gets a
-// fresh process and therefore a fresh environment, time resolution and logger
-// registry.
+// Everything here is host-neutral: the checks are the same for SystemC and for
+// SVDPI, and the only difference is who advances the clock between phases. A
+// scenario therefore keeps its cross-phase state in function-local statics (a
+// capture redirect and a logger handle), which is safe because every scenario
+// runs in its own process on both backends.
+#include "cases.h"
+
 #include <simlog/simlog.h>
-#include <spdlog/details/os.h>
 #include <spdlog/sinks/ostream_sink.h>
 #include <spdlog/spdlog.h>
 
 #include <cstdint>
-#include <cstdio>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 #include "check.h"
 
-// sc_main is called by the SystemC kernel, so it has to stay exported even when
-// the program is built with hidden default visibility.
-#if defined(_WIN32)
-#define SIMLOG_TEST_EXPORT __declspec(dllexport)
-#elif defined(__GNUC__) || defined(__clang__)
-#define SIMLOG_TEST_EXPORT __attribute__((visibility("default")))
-#else
-#define SIMLOG_TEST_EXPORT
-#endif
-
+namespace test::cases {
 namespace {
 
 constexpr const char* kLogger = "tb";
@@ -48,61 +39,79 @@ std::string render(std::string_view payload, std::string_view logger = kLogger,
   return line;
 }
 
-// Stamp field is fixed width: value × resolution multiplier, right-aligned in
-// 12 columns, plus the resolution's base unit.
-void format_scenario() {
-  CHECK_EQ(render("hello"), std::string("[           0 ps][tb][info] hello"));
-  CHECK_EQ(render("hello", "other", spdlog::level::warn),
-           std::string("[           0 ps][other][warning] hello"));
-  CHECK_EQ(render(""), std::string("[           0 ps][tb][info] "));
+// ── format: %* rendering, no logger involved ─────────────────────────
+// Elaboration time is 0 ticks; time only advances once the host starts the
+// simulation. The base declared by the host is also what resolution_unit() must
+// report, so a backend that prints the wrong unit or scale fails here.
+std::uint64_t format_step(const context& ctx, unsigned phase) {
+  if (phase == 0) {
+    CHECK_EQ(render("hello"), expect_line(0, ctx.base, "tb", "info", "hello"));
+    CHECK_EQ(render("hello", "other", spdlog::level::warn),
+             expect_line(0, ctx.base, "other", "warning", "hello"));
+    CHECK_EQ(render(""), expect_line(0, ctx.base, "tb", "info", ""));
 
-  // Elaboration time is 0 ticks; time only advances once sc_start() runs.
-  CHECK_EQ(simlog::detail::now_ticks(), std::uint64_t{0});
-  CHECK_EQ(render("before start"), std::string("[           0 ps][tb][info] before start"));
+    CHECK_EQ(simlog::detail::now_ticks(), std::uint64_t{0});
 
-  sc_core::sc_start(12340, sc_core::SC_PS);
+    const simlog::detail::unit_scale unit = simlog::detail::resolution_unit();
+    CHECK_EQ(unit.scale, ctx.base.scale);
+    CHECK_EQ(std::string_view(unit.symbol), std::string_view(ctx.base.symbol));
+
+    return 12340;
+  }
+
   CHECK_EQ(simlog::detail::now_ticks(), std::uint64_t{12340});
-  CHECK_EQ(render("after start"), std::string("[       12340 ps][tb][info] after start"));
+  CHECK_EQ(render("after start"), expect_line(12340, ctx.base, "tb", "info", "after start"));
 
   // spdlog clones custom flags, so the flag must be independently copyable.
   const simlog::detail::sim_time_flag flag;
   const std::unique_ptr<spdlog::custom_flag_formatter> clone = flag.clone();
   CHECK(clone != nullptr);
+  return 0;
 }
 
-// End-to-end: simlog::get() returns a native, registered spdlog logger whose
-// output carries the simulation time of the log call.
-void stamp_scenario() {
-  test::capture out(test::capture::stream::out);
-  CHECK(out.active());
+// ── stamp: end-to-end through simlog::get(), across time ─────────────
+// The capture stays redirecting stdout across the jumps: the host must be able
+// to advance time while the logger (and its process-wide sink) is alive.
+std::uint64_t stamp_step(const context& ctx, unsigned phase) {
+  static std::unique_ptr<test::capture> out;
+  static std::shared_ptr<spdlog::logger> log;
 
-  const auto log = simlog::get(kLogger);
-  CHECK(log != nullptr);
-  CHECK_EQ(log->name(), std::string(kLogger));
-  CHECK(simlog::get(kLogger) == log);  // repeated calls return the same instance
-  CHECK(spdlog::get(kLogger) == log);  // and it is registered with spdlog
-  CHECK_EQ(static_cast<int>(log->level()), static_cast<int>(spdlog::level::info));
+  if (phase == 0) {
+    out = std::make_unique<test::capture>(test::capture::stream::out);
+    CHECK(out->active());
 
-  // The default sink is process-wide: every simlog logger shares one instance.
-  const auto other = simlog::get("other");
-  CHECK_EQ(other->sinks().size(), std::size_t{1});
-  CHECK(other->sinks().front() == log->sinks().front());
+    log = simlog::get(kLogger);
+    CHECK(log != nullptr);
+    CHECK_EQ(log->name(), std::string(kLogger));
+    CHECK(simlog::get(kLogger) == log);  // repeated calls return the same instance
+    CHECK(spdlog::get(kLogger) == log);  // and it is registered with spdlog
+    CHECK_EQ(static_cast<int>(log->level()), static_cast<int>(spdlog::level::info));
 
-  log->info("reset released");
-  sc_core::sc_start(12340, sc_core::SC_PS);
-  log->info("first");
-  log->info("second");  // same timestep: identical stamp
-  sc_core::sc_start(1, sc_core::SC_PS);
+    // The default sink is process-wide: every simlog logger shares one instance.
+    const auto other = simlog::get("other");
+    CHECK_EQ(other->sinks().size(), std::size_t{1});
+    CHECK(other->sinks().front() == log->sinks().front());
+
+    log->info("reset released");
+    return 12340;
+  }
+
+  if (phase == 1) {
+    log->info("first");
+    log->info("second");  // same timestep: identical stamp
+    return 1;
+  }
+
   log->info("third");
   log->flush();
 
-  const auto lines = test::log_lines(out.stop());
+  const auto lines = test::log_lines(out->stop());
   CHECK_EQ(lines.size(), std::size_t{4});
   if (lines.size() == 4) {
-    CHECK_EQ(lines[0], std::string("[           0 ps][tb][info] reset released"));
-    CHECK_EQ(lines[1], std::string("[       12340 ps][tb][info] first"));
-    CHECK_EQ(lines[2], std::string("[       12340 ps][tb][info] second"));
-    CHECK_EQ(lines[3], std::string("[       12341 ps][tb][info] third"));
+    CHECK_EQ(lines[0], expect_line(0, ctx.base, "tb", "info", "reset released"));
+    CHECK_EQ(lines[1], expect_line(12340, ctx.base, "tb", "info", "first"));
+    CHECK_EQ(lines[2], expect_line(12340, ctx.base, "tb", "info", "second"));
+    CHECK_EQ(lines[3], expect_line(12341, ctx.base, "tb", "info", "third"));
   }
 
   // The logger stays a plain spdlog logger: level filtering is native behaviour.
@@ -115,57 +124,14 @@ void stamp_scenario() {
   const auto quiet_lines = test::log_lines(quiet.stop());
   CHECK_EQ(quiet_lines.size(), std::size_t{1});
   if (quiet_lines.size() == 1) {
-    CHECK_EQ(quiet_lines[0], std::string("[       12341 ps][tb][warning] kept"));
+    CHECK_EQ(quiet_lines[0], expect_line(12341, ctx.base, "tb", "warning", "kept"));
   }
+  return 0;
 }
 
-// A resolution multiplier is folded into the tick count instead of the unit.
-void resolution_100fs_scenario() {
-  sc_core::sc_set_time_resolution(100, sc_core::SC_FS);
-  const auto unit = simlog::detail::resolution_unit();
-  CHECK_EQ(unit.scale, std::uint64_t{100});
-  CHECK_EQ(std::string_view(unit.symbol), std::string_view("fs"));
-
-  test::capture out(test::capture::stream::out);
-  const auto log = simlog::get(kLogger);
-  log->info("start");
-  sc_core::sc_start(1234000, sc_core::SC_FS);  // 12340 ticks, 100 fs each
-  CHECK_EQ(sc_core::sc_time_stamp().value(), static_cast<sc_dt::uint64>(12340));
-  log->info("later");
-  log->flush();
-
-  const auto lines = test::log_lines(out.stop());
-  CHECK_EQ(lines.size(), std::size_t{2});
-  if (lines.size() == 2) {
-    CHECK_EQ(lines[0], std::string("[           0 fs][tb][info] start"));
-    CHECK_EQ(lines[1], std::string("[     1234000 fs][tb][info] later"));
-  }
-}
-
-void resolution_10ns_scenario() {
-  sc_core::sc_set_time_resolution(10, sc_core::SC_NS);
-  const auto unit = simlog::detail::resolution_unit();
-  CHECK_EQ(unit.scale, std::uint64_t{10});
-  CHECK_EQ(std::string_view(unit.symbol), std::string_view("ns"));
-
-  test::capture out(test::capture::stream::out);
-  const auto log = simlog::get(kLogger);
-  log->info("start");
-  sc_core::sc_start(123400, sc_core::SC_NS);  // 12340 ticks, 10 ns each
-  CHECK_EQ(sc_core::sc_time_stamp().value(), static_cast<sc_dt::uint64>(12340));
-  log->info("later");
-  log->flush();
-
-  const auto lines = test::log_lines(out.stop());
-  CHECK_EQ(lines.size(), std::size_t{2});
-  if (lines.size() == 2) {
-    CHECK_EQ(lines[0], std::string("[           0 ns][tb][info] start"));
-    CHECK_EQ(lines[1], std::string("[      123400 ns][tb][info] later"));
-  }
-}
-
+// ── SIMLOG_LEVEL ─────────────────────────────────────────────────────
 // No SIMLOG_LEVEL: the built-in default (info) applies.
-void env_default_scenario() {
+std::uint64_t env_default_step(const context& ctx, unsigned) {
   test::unset_env("SIMLOG_LEVEL");
 
   test::capture out(test::capture::stream::out);
@@ -178,11 +144,12 @@ void env_default_scenario() {
   const auto lines = test::log_lines(out.stop());
   CHECK_EQ(lines.size(), std::size_t{1});
   if (lines.size() == 1) {
-    CHECK_EQ(lines[0], std::string("[           0 ps][tb][info] visible"));
+    CHECK_EQ(lines[0], expect_line(0, ctx.base, "tb", "info", "visible"));
   }
+  return 0;
 }
 
-void env_warn_scenario() {
+std::uint64_t env_warn_step(const context& ctx, unsigned) {
   CHECK(test::set_env("SIMLOG_LEVEL", "warn"));
 
   test::capture out(test::capture::stream::out);
@@ -195,11 +162,12 @@ void env_warn_scenario() {
   const auto lines = test::log_lines(out.stop());
   CHECK_EQ(lines.size(), std::size_t{1});
   if (lines.size() == 1) {
-    CHECK_EQ(lines[0], std::string("[           0 ps][tb][warning] visible"));
+    CHECK_EQ(lines[0], expect_line(0, ctx.base, "tb", "warning", "visible"));
   }
+  return 0;
 }
 
-void env_off_scenario() {
+std::uint64_t env_off_step(const context&, unsigned) {
   CHECK(test::set_env("SIMLOG_LEVEL", "off"));
 
   test::capture out(test::capture::stream::out);
@@ -209,10 +177,11 @@ void env_off_scenario() {
   log->flush();
 
   CHECK_EQ(test::log_lines(out.stop()).size(), std::size_t{0});
+  return 0;
 }
 
 // An invalid value keeps the default and warns once on stderr.
-void env_invalid_scenario() {
+std::uint64_t env_invalid_step(const context&, unsigned) {
   CHECK(test::set_env("SIMLOG_LEVEL", "Bogus"));
 
   test::capture err(test::capture::stream::err);
@@ -223,11 +192,12 @@ void env_invalid_scenario() {
   CHECK(warnings.find("ignoring SIMLOG_LEVEL entry") != std::string::npos);
   CHECK(warnings.find("\"Bogus\"") != std::string::npos);
   CHECK(warnings.find("expected a bare level") != std::string::npos);
+  return 0;
 }
 
 // Module rules in the same variable: verbatim, comma-separated entries (empty
 // ones skipped), unmatched modules keeping the global level.
-void env_modules_scenario() {
+std::uint64_t env_modules_step(const context& ctx, unsigned) {
   CHECK(test::set_env("SIMLOG_LEVEL", "tb=debug,,other=warn,dma0=off,"));
 
   const auto tb = simlog::get("tb");
@@ -248,13 +218,14 @@ void env_modules_scenario() {
   const auto lines = test::log_lines(out.stop());
   CHECK_EQ(lines.size(), std::size_t{1});
   if (lines.size() == 1) {
-    CHECK_EQ(lines[0], std::string("[           0 ps][tb][debug] module level applied"));
+    CHECK_EQ(lines[0], expect_line(0, ctx.base, "tb", "debug", "module level applied"));
   }
+  return 0;
 }
 
 // A lone '*' is the global rule; named and longer patterns override it no matter
 // in which order they appear, and ties go to the rule written later.
-void env_modules_wildcard_scenario() {
+std::uint64_t env_modules_wildcard_step(const context&, unsigned) {
   CHECK(test::set_env("SIMLOG_LEVEL", "dma=info,*=debug,dma*=warn,*tb=err"));
 
   CHECK(simlog::detail::level_for("dma") == spdlog::level::info);   // exact beats every wildcard
@@ -267,32 +238,35 @@ void env_modules_wildcard_scenario() {
 
   CHECK_EQ(static_cast<int>(simlog::get("dma")->level()), static_cast<int>(spdlog::level::info));
   CHECK_EQ(static_cast<int>(simlog::get("core_tb")->level()), static_cast<int>(spdlog::level::err));
+  return 0;
 }
 
 // The documented example: "*=debug,dma=info".
-void env_modules_global_scenario() {
+std::uint64_t env_modules_global_step(const context&, unsigned) {
   CHECK(test::set_env("SIMLOG_LEVEL", "*=debug,dma=info"));
 
   CHECK(simlog::detail::level_for("dma") == spdlog::level::info);
   CHECK(simlog::detail::level_for("tb") == spdlog::level::debug);
   CHECK(simlog::detail::level_for("uart0") == spdlog::level::debug);
   CHECK(simlog::detail::level_for("dma0") == spdlog::level::debug);
+  return 0;
 }
 
 // Named rules win over the global rule regardless of the order they are written
 // in: the same value with the named rule first gives the same levels.
-void env_modules_order_scenario() {
+std::uint64_t env_modules_order_step(const context&, unsigned) {
   CHECK(test::set_env("SIMLOG_LEVEL", "dma=info,*=debug"));
 
   CHECK(simlog::detail::level_for("dma") == spdlog::level::info);
   CHECK(simlog::detail::level_for("tb") == spdlog::level::debug);
   CHECK(simlog::detail::level_for("uart0") == spdlog::level::debug);
   CHECK(simlog::detail::level_for("dma0") == spdlog::level::debug);
+  return 0;
 }
 
 // Malformed entries are reported once each and ignored, so those modules fall
 // back to the global level like unmatched ones.
-void env_modules_invalid_scenario() {
+std::uint64_t env_modules_invalid_step(const context&, unsigned) {
   CHECK(test::set_env("SIMLOG_LEVEL",
                       "tb=bogus,uart=,=debug,broken,core=err, dma1=warn,uart0 =warn,dma2= warn"));
 
@@ -318,10 +292,11 @@ void env_modules_invalid_scenario() {
   CHECK(notices.find("=debug") != std::string::npos);
   CHECK(notices.find("broken") != std::string::npos);
   CHECK(notices.find("\" dma1=warn\"") != std::string::npos);  // reported verbatim
+  return 0;
 }
 
 // A logger registered before simlog::get() is returned untouched.
-void registry_scenario() {
+std::uint64_t registry_step(const context&, unsigned) {
   CHECK(spdlog::get("pre") == nullptr);
 
   std::ostringstream pre_stream;
@@ -340,9 +315,10 @@ void registry_scenario() {
   pre->error("kept pattern");
   pre->flush();
   CHECK_EQ(pre_stream.str(), std::string("custom: kept pattern\n"));
+  return 0;
 }
 
-void parse_level_scenario() {
+std::uint64_t parse_level_step(const context&, unsigned) {
   using spdlog::level::level_enum;
   CHECK(simlog::detail::parse_level("trace") == level_enum::trace);
   CHECK(simlog::detail::parse_level("debug") == level_enum::debug);
@@ -372,59 +348,53 @@ void parse_level_scenario() {
   CHECK(simlog::detail::wildcard_match("", ""));
 
   CHECK(simlog::detail::default_sink() == simlog::detail::default_sink());
+  return 0;
 }
 
 }  // namespace
 
-SIMLOG_TEST_EXPORT int sc_main(int argc, char** argv) {
-  if (argc < 2) {
-    std::fprintf(stderr, "usage: %s <scenario>\n", argc > 0 ? argv[0] : "tests");
-    return 2;
-  }
-
-  const std::string_view scenario(argv[1]);
-
-  // Keep scenarios hermetic: only the env-* ones set SIMLOG_LEVEL themselves.
-  if (scenario.substr(0, 4) != "env-") test::unset_env("SIMLOG_LEVEL");
-
-  if (scenario == "format") {
-    format_scenario();
-  } else if (scenario == "stamp") {
-    stamp_scenario();
-  } else if (scenario == "resolution-100fs") {
-    resolution_100fs_scenario();
-  } else if (scenario == "resolution-10ns") {
-    resolution_10ns_scenario();
-  } else if (scenario == "env-default") {
-    env_default_scenario();
-  } else if (scenario == "env-warn") {
-    env_warn_scenario();
-  } else if (scenario == "env-off") {
-    env_off_scenario();
-  } else if (scenario == "env-invalid") {
-    env_invalid_scenario();
-  } else if (scenario == "env-modules") {
-    env_modules_scenario();
-  } else if (scenario == "env-modules-wildcard") {
-    env_modules_wildcard_scenario();
-  } else if (scenario == "env-modules-global") {
-    env_modules_global_scenario();
-  } else if (scenario == "env-modules-order") {
-    env_modules_order_scenario();
-  } else if (scenario == "env-modules-invalid") {
-    env_modules_invalid_scenario();
-  } else if (scenario == "registry") {
-    registry_scenario();
-  } else if (scenario == "parse-level") {
-    parse_level_scenario();
-  } else {
-    std::fprintf(stderr, "unknown scenario: %s\n", argv[1]);
-    return 2;
-  }
-
-  if (test::failures != 0) {
-    std::fprintf(stderr, "%d check(s) failed (scenario %s)\n", test::failures, argv[1]);
-    return 1;
-  }
-  return 0;
+std::string expect_stamp(std::uint64_t ticks, const time_base& base) {
+  const std::uint64_t value = ticks * base.scale;  // test tick counts stay small
+  std::string number = std::to_string(value);
+  if (number.size() < 12) number.insert(0, 12 - number.size(), ' ');
+  return "[" + number + " " + base.symbol + "]";
 }
+
+std::string expect_line(std::uint64_t ticks, const time_base& base, std::string_view logger,
+                        std::string_view level, std::string_view payload) {
+  return expect_stamp(ticks, base) + "[" + std::string(logger) + "][" + std::string(level) + "] " +
+         std::string(payload);
+}
+
+const std::vector<scenario>& shared() {
+  static const std::vector<scenario> scenarios{
+      {"format", format_step},
+      {"stamp", stamp_step},
+      {"env-default", env_default_step},
+      {"env-warn", env_warn_step},
+      {"env-off", env_off_step},
+      {"env-invalid", env_invalid_step},
+      {"env-modules", env_modules_step},
+      {"env-modules-wildcard", env_modules_wildcard_step},
+      {"env-modules-global", env_modules_global_step},
+      {"env-modules-order", env_modules_order_step},
+      {"env-modules-invalid", env_modules_invalid_step},
+      {"registry", registry_step},
+      {"parse-level", parse_level_step},
+  };
+  return scenarios;
+}
+
+const scenario* find(std::string_view name) {
+  for (const scenario& scn : shared()) {
+    if (name == scn.name) return &scn;
+  }
+  return nullptr;
+}
+
+void prepare(const scenario& scn) {
+  // Keep scenarios hermetic: only the env-* ones set SIMLOG_LEVEL themselves.
+  if (std::string_view(scn.name).substr(0, 4) != "env-") test::unset_env("SIMLOG_LEVEL");
+}
+
+}  // namespace test::cases

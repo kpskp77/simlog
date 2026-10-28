@@ -1,10 +1,11 @@
-// SystemC integration example: a minimal testbench, no initialization call —
-// just get() a logger and use it.
+// SystemC integration example (SystemC backend: --backend=systemc /
+// SIMLOG_BACKEND_SYSTEMC): a minimal testbench, no initialization call — just
+// get() a logger and use it. examples/svdpi/tb.sv is the SystemVerilog
+// counterpart (its own six lines, at 1 ps simulation resolution).
 #include <simlog/simlog.h>
 
-// sc_main is invoked by libsystemc, so it must stay exported even when the
-// program is built with hidden default visibility (e.g. release builds with
-// -fvisibility=hidden).
+// sc_main is invoked by libsystemc, so it must stay exported if the program is
+// ever built with hidden default visibility.
 #if defined(_WIN32)
 #define SIMLOG_EXAMPLE_EXPORT __declspec(dllexport)
 #elif defined(__GNUC__) || defined(__clang__)
