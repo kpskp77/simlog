@@ -4,6 +4,15 @@ set_languages("c++17")
 
 add_rules("mode.debug", "mode.release")
 
+-- Top-level on purpose: add_requires is not allowed after option/target blocks here.
+-- Shared on purpose: the spdlog logger registry must live in one place per
+-- process (libspdlog.so), not one copy per shared object. header_only must be
+-- false or the package silently stays header-only and every DSO keeps its own
+-- registry again.
+add_requires("spdlog", { configs = { header_only = false, shared = true } })
+add_requires("systemc", { configs = { shared = true } })
+add_requires("svdpi")
+
 -- The only backend switch: it picks the define on `simlog`, never a run-time option.
 option("backend", function()
   set_default("svdpi")
@@ -11,18 +20,6 @@ option("backend", function()
   set_description("simulation-time backend: svdpi (DPI-C, default) or systemc")
   set_showmenu(true)
 end)
-
--- Top-level on purpose: add_requires is not allowed after option/target blocks here.
--- Shared on purpose: the spdlog logger registry must live in one place per
--- process (libspdlog.so), not one copy per shared object. header_only must be
--- false or the package silently stays header-only and every DSO keeps its own
--- registry again.
-add_requires("spdlog", { configs = { header_only = false, shared = true } })
-if get_config("backend") == "systemc" then
-  add_requires("systemc", { configs = { shared = true } })
-else
-  add_requires("svdpi")
-end
 
 -- One target, one backend: header-only for SystemC, libsimlog.so for SVDPI. src/simlog.cpp
 -- is compiled exactly once, here.
