@@ -39,8 +39,8 @@ xmake run tests stamp          # run one scenario directly
 - **The split is about the time source, not the build kind**: `simlog.h` holds the API and all
   shared code, `src/simlog.cpp` the SVDPI backend and the SV-side C ABI. Verify both backends:
   `xmake test` covers SystemC only, the SVDPI backend is verified by `xmake run vcs-test`. Without a
-  simulator, the SVDPI check is `nm -D libsimlog.so` (five exported functions, four weak-undefined
-  time symbols) — say so when reporting.
+  simulator, the SVDPI check is `nm -D libsimlog.so` (six exported functions, five weak-undefined
+  simulator symbols: four time functions plus `vpi_printf`) — say so when reporting.
 - `xmake` runs with `-Wall -Wextra -Werror` on every target; a warning is a build failure, never
   silence one to get green.
 - spdlog (shared), svdpi (header-only `<svdpi.h>`) and SystemC (shared) come from xrepo via
@@ -60,10 +60,12 @@ xmake run tests stamp          # run one scenario directly
 ## Layout
 
 ```
-include/simlog/simlog.h   header-only API: backend selection / env config / %* flag / levels / get()
-                          (the SystemC backend's time source is in here too; SVDPI's is not)
-src/simlog.cpp            the SVDPI backend + the SV side's extern "C" ABI (declarations and
-                          definitions in one file, no header), built as libsimlog.so
+include/simlog/simlog.h   header-only API: backend selection / env config / %* flag / levels /
+                          default sink / get() (the SystemC backend's time source is in here too;
+                          SVDPI's is not)
+src/simlog.cpp            the SVDPI backend (time source + the default sink's writer) + the SV
+                          side's extern "C" ABI (declarations and definitions in one file, no
+                          header), built as libsimlog.so
 sv/simlog_pkg.sv          SystemVerilog side: simlog_logger (one object per logger) over that C ABI
 examples/svdpi/tb.sv      pure-SystemVerilog example: two modules, each `simlog_logger` created
                           with `$sformatf("%m")`; run by examples/svdpi/run.sh (VCS; output checked
@@ -80,8 +82,9 @@ tests/svdpi/cpp/          category 2: SVDPI with simlog used from C++ (core_dpi.
                           phase driver, tb_cpp.sv only applies #delay)
 tests/svdpi/sv/           category 3: SVDPI with simlog used through sv/simlog_pkg.sv (proxy)
 tests/svdpi/mixed/        category 4: C++ + SV through one logger entity (one shared object)
-tests/svdpi/run.sh        categories 2-4: compile per timescale, run one scenario per process
-                          (category 2 asserts in C++; 3 and 4 diff exact lines)
+tests/svdpi/run.sh        categories 2-4: compile per timescale, run one scenario per process with
+                          `simv -l sim.log` (category 2 asserts in C++; 3 and 4 diff the exact lines
+                          out of that simulator log, not out of stdout)
 tests/check.h             CHECK / CHECK_EQ, stream capture, env helpers (no test framework)
 xmake.lua                 backend option + one simlog target (headeronly / shared per backend);
                           svdpi: example + categories 2-4; systemc: example + category 1
@@ -95,9 +98,10 @@ time source, 3 `%*` flag/formatter/default sink, 4 `get()`. Keep new code in the
 
 - **Exactly one public C++ API: `simlog::get(name)`.** Everything else stays in `simlog::detail`. No
   builder type, no second high-level entry point, no `init()`. The C ABI of `libsimlog.so` is exactly
-  five functions: the two time accessors declared in `simlog.h` (`simlog_sv_now_ticks` /
-  `simlog_sv_resolution_unit`) plus the three SV-facing bridge functions (`simlog_open` /
-  `simlog_log` / `simlog_flush`), which exist because SystemVerilog cannot call a C++ object.
+  six functions: the two time accessors declared in `simlog.h` (`simlog_sv_now_ticks` /
+  `simlog_sv_resolution_unit`), the writer behind the default sink (`simlog_sv_write`), plus the three
+  SV-facing bridge functions (`simlog_open` / `simlog_log` / `simlog_flush`), which exist because
+  SystemVerilog cannot call a C++ object.
 - **The bridge is a facade**: obtain the logger through `simlog::get()` (never create or reconfigure
   one), log through the native logger with the message as a `"{}"` argument (never as the format
   string), take **no timestamp** from the SV side, and report a broken argument (empty name, null
@@ -120,9 +124,12 @@ time source, 3 `%*` flag/formatter/default sink, 4 `get()`. Keep new code in the
 - **Exactly one backend is compiled in**, `SIMLOG_BACKEND_SVDPI` by default. The macros are the only
   switch — never a run-time switch, never both at once — and the header must keep working with **no**
   define at all.
-- **The backends meet the rest of the library at exactly two functions**: `now_ticks()` and
-  `resolution_unit()` (`{scale, symbol}`). The `%*` flag, the pattern, the levels, the default sink
-  and `get()` stay backend-agnostic; new time-reading behaviour belongs in those two functions.
+- **The backends meet the rest of the library at exactly three functions**: `now_ticks()`,
+  `resolution_unit()` (`{scale, symbol}`) and `simlog_sv_write(text, size)` for the default sink. The
+  `%*` flag, the pattern, the levels and `get()` stay backend-agnostic; only the *destination* of a
+  line follows the backend (the simulator's output stream on SVDPI, stdout on SystemC), because that
+  is a property of the host. New time-reading behaviour belongs in the first two functions, new
+  output routing in the third.
 - **Each backend has exactly one time source per process.** SVDPI: `svGetTime(NULL, …)` +
   `svGetTimePrecision(NULL, …)` (`sv_sim_time`, never `sv_scaled_real_time`) when the simulator
   implements IEEE 1800-2023, otherwise `vpi_get_time(NULL, …)` + `tf_gettimeprecision()`, chosen once
@@ -145,8 +152,9 @@ time source, 3 `%*` flag/formatter/default sink, 4 `get()`. Keep new code in the
   keeping the default/global level. `spdlog::level::from_str()` stays unused (unknown names map to
   `off`, silently disabling logging). The DPI backend follows the same rule: zero stamp **plus** one
   stderr notice per process.
-- **Single-threaded model**: no locks, no atomics; the default sink is the `_st` variant and is one
-  process-wide shared instance. Any change that needs a mutex is a design change.
+- **Single-threaded model**: no locks, no atomics; the default sink is the `_st` / null-mutex
+  variant and is one process-wide shared instance (`stdout_color_sink_st` on SystemC, a plain
+  `base_sink<spdlog::details::null_mutex>` on SVDPI). Any change that needs a mutex is a design change.
 - **Synchronous loggers only** (documented limitation): an async logger formats on a background
   thread and the stamp would be the output time.
 - **C++17 floor.** Everything in `simlog.h` is `inline` so any translation unit can include it, and
@@ -159,6 +167,13 @@ time source, 3 `%*` flag/formatter/default sink, 4 `get()`. Keep new code in the
   pre-2023 simulator (VCS O-2018.09 exports neither). Keep the fallback a plain value query: no VPI
   handle, no `vpi_iterate`/`vpi_scan`, no callback, no registration, no simulator header include
   (the four signatures are declared in `simlog.cpp`; `svTimeVal` *is* `s_vpi_time`).
+- **The SVDPI default sink prints through the simulator, not through stdout.** A DPI-C library's
+  `printf` goes to the C runtime's stream, which `simv -l sim.log` does not copy — the C++ lines would
+  be missing from the simulation log. `simlog_sv_write` therefore prefers the standard IEEE 1800 VPI
+  routine `vpi_printf()` (weak, like the time functions) and falls back to `stdout` only when the host
+  has no VPI. The line is passed as a `"%.*s"` argument, never as the format string. Do not replace
+  this with a vendor routine (`io_printf`), a `FILE*` sink or a second sink: one process-wide sink,
+  one writer, and `simlog::get()` still attaches it.
 - **`get()` takes `const std::string&`**: spdlog's registry only accepts `std::string`, and a view
   would force an allocation on the registered-logger fast path.
 
@@ -169,9 +184,10 @@ time source, 3 `%*` flag/formatter/default sink, 4 `get()`. Keep new code in the
 | New environment knob / rule semantics | `simlog.h` section 1 (`parse_*`, `level_for`) |
 | New time formatting / resolution handling (shared) | `simlog.h` section 3 (`sim_time_flag`) |
 | Time reading of the SystemC backend | `simlog.h` section 2, inside the SystemC `#if` branch only |
-| Time reading of the SVDPI backend | `src/simlog.cpp` — `simlog.h` keeps only the two `extern "C"` declarations |
+| Time reading of the SVDPI backend | `src/simlog.cpp` — `simlog.h` keeps only the three `extern "C"` declarations |
+| Output routing of the default sink (SVDPI) | `src/simlog.cpp` (`simlog_sv_write`); the sink class itself is `simlog.h` section 3 |
 | The SV-side C ABI | `src/simlog.cpp` (no header: the target that compiles it carries its own declaration — `tests/svdpi/mixed/mixed.cpp` does) |
-| A third backend | `simlog.h` backend block + a new branch in section 2 (two functions!), the `backend` option in `xmake.lua`, a test suite, README/AGENTS — treat it as a scope decision |
+| A third backend | `simlog.h` backend block + a new branch in section 2 (three functions!), a sink in section 3 if the host needs its own output stream, the `backend` option in `xmake.lua`, a test suite, README/AGENTS — treat it as a scope decision |
 | New scenario | **Shared (preferred):** a phase-stepped function in `tests/cases.cpp` + the `shared()` list, then the name in the `add_tests()` list in `xmake.lua` **and** in `CPP_SCENARIOS` in `tests/svdpi/run.sh`. **SystemC-only:** `tests/systemc/tests.cpp` + `add_tests()` |
 | A real-simulator C++ case | a new shared scenario, or a dedicated phase/export in `tests/svdpi/cpp/core_dpi.cpp` + a plusarg arm in `tb_cpp.sv` + a run in `run.sh` |
 | A new SV-side helper | `sv/simlog_pkg.sv` — and, only if new behaviour is needed, a function in `src/simlog.cpp`; never a time source or a level policy in SystemVerilog |
@@ -208,8 +224,12 @@ Anything that needs a new file in `include/simlog/` is a scope decision: update 
 - **The SVDPI side has one harness: the simulator.** `tests/svdpi/run.sh` is where coverage is added.
   Category 2 runs the shared scenarios through `core_dpi.cpp` + `tb_cpp.sv` and asserts in C++;
   categories 3 and 4 pass expected lines on stdin to `check_sv` / `check_mixed` and diff the exact
-  log lines. Category 2 runs the full shared suite at 1 ps and `format`/`stamp` at 100 fs / 1 ns /
-  1 fs; the runner passes `+scale`/`+unit` so expected stamps stay backend-independent.
+  log lines **read from the simulator's own log (`simv -l sim.log`)**, not from the stdout redirect —
+  that is what proves the lines travel through the simulator's output stream. The `[simlog]` stderr
+  notices stay in the stdout/stderr redirect on purpose: they are diagnostics for the user running
+  the simulator, not part of its log. Category 2 runs the full shared suite at 1 ps and
+  `format`/`stamp` at 100 fs / 1 ns / 1 fs; the runner passes `+scale`/`+unit` so expected stamps
+  stay backend-independent.
 
 ## Code style (mandatory before committing)
 
@@ -235,25 +255,33 @@ stylua xmake.lua
   `tests/systemc/tests.cpp` uses `SIMLOG_TEST_EXPORT`, so they still run if a build ever uses hidden
   default visibility. Dropping it links but never runs.
 - **`xmake run` is mandatory** for anything linking SystemC (no rpath from `add_packages`).
-- **The SVDPI time symbols are weak on purpose**: `svGetTime` / `svGetTimePrecision` and
-  `vpi_get_time` / `tf_gettimeprecision` are `__attribute__((weak))` (other compilers get strong
-  references and no fallback). Never turn them back into hard references: VCS O-2018.09 exports none
-  of them, so the link fails. Detection is the pointer being non-null at run time — no env-var or
-  compile-time switch.
-- **`libsimlog.so` must keep its five entry points exported and its time symbols unresolved.**
+- **The SVDPI simulator symbols are weak on purpose**: `svGetTime` / `svGetTimePrecision`,
+  `vpi_get_time` / `tf_gettimeprecision` and `vpi_printf` are `__attribute__((weak))` (other
+  compilers get strong references and no fallback). Never turn them back into hard references: VCS
+  O-2018.09 exports none of the time ones, so the link fails. Detection is the pointer being non-null
+  at run time — no env-var or compile-time switch.
+- **`libsimlog.so` must keep its six entry points exported and its simulator symbols unresolved.**
   `SIMLOG_EXPORT` (default visibility) is what makes `nm -D` list `simlog_open` / `simlog_log` /
-  `simlog_flush` / `simlog_sv_now_ticks` / `simlog_sv_resolution_unit`. The spdlog registry lives
+  `simlog_flush` / `simlog_sv_now_ticks` / `simlog_sv_resolution_unit` / `simlog_sv_write`. The spdlog
+  registry lives
   in the shared `libspdlog.so`: category 4's single-entity check passes only because every DSO
   links that same shared package; reverting spdlog to header-only gives each DSO its own registry
   again and breaks the test. The four
-  simulator time functions must stay **weak undefined** (`w` in `nm -D`): never link a simulator
-  library, never add `--no-undefined`. **C linkage is name-only**, so the names in `src/simlog.cpp`
-  and `sv/simlog_pkg.sv` must be kept in step by hand — a renamed function still links and corrupts
-  the arguments at run time.
+  simulator time functions and `vpi_printf` must stay **weak undefined** (`w` in `nm -D`): never link
+  a simulator library, never add `--no-undefined`. **C linkage is name-only**, so the names in
+  `src/simlog.cpp` and `sv/simlog_pkg.sv` must be kept in step by hand — a renamed function still
+  links and corrupts the arguments at run time.
 - **A shared library cannot see an executable's symbols unless they are exported**: `libsimlog.so`
-  resolves the four time functions in the global scope, so the *host* has to export them (a simulator
-  does). If you link the library into a host binary, that binary needs default visibility and
-  `-rdynamic` — otherwise every stamp silently becomes `0 s` plus a notice.
+  resolves the four time functions and `vpi_printf` in the global scope, so the *host* has to export
+  them (a simulator does). If you link the library into a host binary, that binary needs default
+  visibility and `-rdynamic` — otherwise every stamp silently becomes `0 s` plus a notice, and the
+  log lines fall back to stdout instead of the simulator's log.
+- **A DPI-C library's `printf` does not reach `simv -l sim.log`**: VCS copies its *own* output
+  stream into the `-l` file, so the C++ side of a testbench has to print through the simulator. That
+  is what `simlog_sv_write` (`vpi_printf`) is for; the symptom of losing it is a complete log file
+  with the SV lines but none of the C++ ones. Two consequences: the default SVDPI sink is a plain
+  `base_sink` (no ANSI colour in the file, and `%^%l%$` simply records a colour range nothing
+  consumes), and the category-3/4 diffs read the `-l` file so a regression cannot pass.
 - **SystemVerilog has no variadic functions, no variadic macros and no method overloading**: that is
   why `simlog_logger` takes a finished string and the call site uses `$sformatf`. Do not pass a format
   plus arguments through DPI, and do not move `$sformatf` into C++.

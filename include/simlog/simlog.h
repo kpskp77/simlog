@@ -19,7 +19,9 @@
 // SVDPI default means DPI-C code needs no define at all; defining both is an
 // #error. Nothing else depends on the choice: the backends answer the same two
 // questions (now_ticks(), resolution_unit()) and everything else — the %* flag,
-// the pattern, the levels, the default sink, simlog::get() — is shared.
+// the pattern, the levels, simlog::get() — is shared. Only the default sink
+// follows the backend, because where a line has to go is a property of the host:
+// the simulator's own output on SVDPI (`simv -l sim.log`), stdout on SystemC.
 // No initialization call of any kind is needed.
 //
 // The only public API is simlog::get(); everything else lives in simlog::detail.
@@ -49,7 +51,6 @@
 
 #include <spdlog/common.h>
 #include <spdlog/pattern_formatter.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
 #include <array>
@@ -66,7 +67,14 @@
 #include <vector>
 
 #if defined(SIMLOG_BACKEND_SYSTEMC)
+#include <spdlog/sinks/stdout_color_sinks.h>
+
 #include <systemc>
+#else
+// The SVDPI default sink is a plain base_sink (section 3); the backend itself
+// never touches a stdio stream when the simulator can print for it.
+#include <spdlog/details/null_mutex.h>
+#include <spdlog/sinks/base_sink.h>
 #endif  // SIMLOG_BACKEND_SYSTEMC
 
 namespace simlog::detail {
@@ -304,11 +312,13 @@ struct unit_scale {
 // object is one library state (registry, default sink, SIMLOG_LEVEL snapshot), so
 // hold exactly one copy.
 //
-// The two functions below are the entire contract between this header (the %*
-// flag, the pattern) and the backend (the clock); `extern "C"` because they are
-// what the shared library exports. src/simlog.cpp asks the simulator through the
-// DPI time API and falls back to the VPI/PLI functions, both as weak references; a
-// host that answers neither keeps the stamp at 0 and says so once on stderr.
+// The three functions below are the entire contract between this header (the %*
+// flag, the pattern, the default sink) and the backend (the clock and the
+// simulator's output); `extern "C"` because they are what the shared library
+// exports. src/simlog.cpp asks the simulator through the DPI time API and falls
+// back to the VPI/PLI functions, all as weak references; a host that answers
+// neither time API keeps the stamp at 0 and says so once on stderr, and a host
+// without vpi_printf() gets the sink's lines on stdout instead.
 
 extern "C" {
 
@@ -318,6 +328,14 @@ extern "C" {
 
 // Display form of the current simulation precision: {multiplier, base symbol}.
 [[nodiscard]] unit_scale simlog_sv_resolution_unit();
+
+// Hand one finished log line to the simulator's own output (the default sink of
+// this backend, section 3). A DPI-C library's stdout is not part of the
+// simulator's output stream, so `simv -l sim.log` would miss every line; the
+// implementation prefers the standard VPI routine vpi_printf() and writes to
+// stdout itself only when the host has no VPI (a plain host-side program). The
+// text is not NUL-terminated: `size` is authoritative.
+void simlog_sv_write(const char* text, std::size_t size);
 
 }  // extern "C"
 
@@ -388,11 +406,52 @@ public:
   return pf;
 }
 
-// Default sink: a process-wide shared colored stdout sink (single-threaded
-// variant, matching the single-threaded simulation model). If you need a file
-// sink, just push_back() onto logger->sinks() after obtaining the logger.
-[[nodiscard]] inline std::shared_ptr<spdlog::sinks::stdout_color_sink_st> default_sink() {
+#if defined(SIMLOG_BACKEND_SVDPI)
+// The SVDPI default sink: format the line here and let the simulator print it.
+//
+// The reason is the log file, not cosmetics: a DPI-C library is an ordinary shared
+// object, so its stdout is the C runtime's stream and `simv -l sim.log` does not
+// see it. vpi_printf() is the simulator's own output routine, which is exactly
+// what -l duplicates into the file (and what $display goes through), so the C++
+// side of a real testbench finally lands in the simulation log, in order, next to
+// the SystemVerilog lines.
+//
+// It is a plain base_sink on purpose: the color codes of a console sink are noise
+// in a log file, and the only writer that reaches the simulator's stream is the
+// backend's. base_sink already runs the logger's formatter (set by get()) and
+// ignores the color range markers of the fixed pattern, so the line is formatted
+// once, exactly as for the SystemC backend.
+class simulator_sink final : public spdlog::sinks::base_sink<spdlog::details::null_mutex> {
+public:
+  simulator_sink() = default;
+
+protected:
+  void sink_it_(const spdlog::details::log_msg& msg) override {
+    spdlog::memory_buf_t formatted;
+    formatter_->format(msg, formatted);
+    simlog_sv_write(formatted.data(), formatted.size());
+  }
+
+  // Nothing is buffered on this side: vpi_printf() hands each line over
+  // immediately, and the stdout fallback flushes inside the writer. A no-op here
+  // is the honest implementation, not a missing one.
+  void flush_() override {}
+};
+#endif  // SIMLOG_BACKEND_SVDPI
+
+// Default sink: one process-wide shared instance (single-threaded variant,
+// matching the single-threaded simulation model).
+//   SVDPI:   the simulator's output stream, through vpi_printf() (see above), so
+//            `simv -l sim.log` contains the lines; stdout when there is no VPI.
+//   SystemC: colored stdout.
+// If you need a file sink, just push_back() onto logger->sinks() after obtaining
+// the logger.
+[[nodiscard]] inline std::shared_ptr<spdlog::sinks::sink> default_sink() {
+#if defined(SIMLOG_BACKEND_SVDPI)
+  static const auto sink = std::make_shared<simulator_sink>();
+#else
   static const auto sink = std::make_shared<spdlog::sinks::stdout_color_sink_st>();
+#endif
   return sink;
 }
 

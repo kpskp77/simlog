@@ -18,6 +18,12 @@
 # bench's exit status is the result. Categories 3 and 4 cannot capture stdout
 # from SystemVerilog, so their exact lines are expected on stdin here and diffed.
 #
+# Every run also passes `simv -l sim.log`, and categories 3 and 4 diff that file
+# instead of the stdout redirect: it is the documented way to keep a simulation
+# log, and only lines that go through the simulator's own output stream land in
+# it. A default sink that wrote to the C runtime's stdout would therefore fail
+# these cases, which is exactly the bug `vpi_printf` in src/simlog.cpp fixes.
+#
 # Skipped (exit 0) when `vcs` is not on PATH, so the target is safe to run
 # everywhere.
 set -uo pipefail
@@ -59,20 +65,23 @@ compile_simv() {
   fi
 }
 
-# run_simv <dir> <logfile> <SIMLOG_LEVEL or ""> [plusargs...]
+# run_simv <cwd> <stdout logfile> <simulator log> <SIMLOG_LEVEL or ""> [plusargs...]
 # The level is set or unset inside the subshell, so a SIMLOG_LEVEL inherited from
 # the caller cannot make a non-env case non-hermetic (the SV-only categories have
-# no C++ prepare() to unset it for them).
+# no C++ prepare() to unset it for them). -l gives the simulator's own log next to
+# the stdout redirect; categories 3 and 4 diff that file, so the simlog lines have
+# to travel through the simulator's output (vpi_printf) to count as correct.
+# simv writes the -l file relative to its cwd, hence the explicit path.
 run_simv() {
-  local dir=$1 logfile=$2 level=$3
-  shift 3
+  local dir=$1 logfile=$2 simlog=$3 level=$4
+  shift 4
   (
     cd "$dir" || exit 1
     if [[ -n $level ]]; then
-      SIMLOG_LEVEL="$level" timeout 300 ./simv "$@" >"$logfile" 2>&1 </dev/null
+      SIMLOG_LEVEL="$level" timeout 300 ./simv -l "$simlog" "$@" >"$logfile" 2>&1 </dev/null
     else
       unset SIMLOG_LEVEL
-      timeout 300 ./simv "$@" >"$logfile" 2>&1 </dev/null
+      timeout 300 ./simv -l "$simlog" "$@" >"$logfile" 2>&1 </dev/null
     fi
   )
 }
@@ -100,7 +109,8 @@ run_cpp_group() {
 
   for scn in "$@"; do
     logfile="$dir/$scn.log"
-    if ! run_simv "$dir" "$logfile" "" "+scenario=$scn" "+scale=$scale" "+unit=$unit"; then
+    if ! run_simv "$dir" "$logfile" "$dir/sim.log" "" \
+      "+scenario=$scn" "+scale=$scale" "+unit=$unit"; then
       echo "[svdpi-test] FAIL category-2/$scn ($tag): simv exited non-zero, see $logfile" >&2
       tail -n 8 "$logfile" >&2
       failures=$((failures + 1))
@@ -120,21 +130,22 @@ SV_DIR="$work/sv"
 echo "[svdpi-test] category 3 (sv): building the proxy-class bench"
 if compile_simv "$SV_DIR" "1ps/1ps" "$root/sv/simlog_pkg.sv" "$here/sv/proxy.sv" "$bridge"; then
   # check_sv <name> <SIMLOG_LEVEL or ""> <required stderr text or "">, expected
-  # log lines on stdin. Only log lines are diffed; the [simlog] notices are
-  # checked separately so an invalid-argument case can assert on them.
+  # log lines on stdin. The log lines are diffed out of the simulator's log file
+  # (-l sim.log), the [simlog] notices out of the stdout/stderr redirect: they are
+  # written to stderr and deliberately do not become part of the simulation log.
   check_sv() {
     local name=$1 level=$2 stderr_text=$3
     local dir="$work/sv-runs/$name"
 
     mkdir -p "$dir"
     cat >"$dir/expected.txt"
-    if ! run_simv "$SV_DIR" "$dir/run.log" "$level" "+scenario=$name"; then
+    if ! run_simv "$SV_DIR" "$dir/run.log" "$dir/sim.log" "$level" "+scenario=$name"; then
       echo "[svdpi-test] FAIL category-3/$name: simv exited non-zero, see $dir/run.log" >&2
       tail -n 8 "$dir/run.log" >&2
       failures=$((failures + 1))
       return
     fi
-    grep -E '^\[ +[0-9]' "$dir/run.log" >"$dir/actual.txt"
+    grep -E '^\[ +[0-9]' "$dir/sim.log" >"$dir/actual.txt"
     if ! diff -u "$dir/expected.txt" "$dir/actual.txt"; then
       echo "[svdpi-test] FAIL category-3/$name: log lines differ (expected above, actual below)" >&2
       failures=$((failures + 1))
@@ -197,13 +208,13 @@ if compile_simv "$MIXED_DIR" "1ps/1ps" "$root/sv/simlog_pkg.sv" "$here/mixed/tb_
 
     mkdir -p "$dir"
     cat >"$dir/expected.txt"
-    if ! run_simv "$MIXED_DIR" "$dir/run.log" "$level" "+scenario=$name"; then
+    if ! run_simv "$MIXED_DIR" "$dir/run.log" "$dir/sim.log" "$level" "+scenario=$name"; then
       echo "[svdpi-test] FAIL category-4/$name: simv exited non-zero, see $dir/run.log" >&2
       tail -n 8 "$dir/run.log" >&2
       failures=$((failures + 1))
       return
     fi
-    grep -E '^\[ +[0-9]' "$dir/run.log" >"$dir/actual.txt"
+    grep -E '^\[ +[0-9]' "$dir/sim.log" >"$dir/actual.txt"
     if ! diff -u "$dir/expected.txt" "$dir/actual.txt"; then
       echo "[svdpi-test] FAIL category-4/$name: log lines differ (expected above, actual below)" >&2
       failures=$((failures + 1))

@@ -1,15 +1,17 @@
 // src/simlog.cpp — the SVDPI backend of simlog, in one translation unit:
 //
 //   1. the time source (asks the simulator for the global simulation time)
-//   2. the SystemVerilog-facing C ABI (`simlog_open` / `simlog_log` /
+//   2. the writer behind the default sink (prints the line through the simulator,
+//      so `simv -l sim.log` contains it)
+//   3. the SystemVerilog-facing C ABI (`simlog_open` / `simlog_log` /
 //      `simlog_flush`) that sv/simlog_pkg.sv wraps in `simlog_logger`
 //
-// Both are compiled into libsimlog.so (the `simlog` target, SVDPI configuration
-// only). Keeping them here is what leaves simlog.h free of `<svdpi.h>` and of any
-// simulator declaration, so DPI-C code may include `<vpi_user.h>` / `<veriuser.h>`
-// next to it without the `t_vpi_time` / `VPI_TIME` redefinition trap, and the four
-// time functions are weak references in one library instead of in every user
-// translation unit.
+// All three are compiled into libsimlog.so (the `simlog` target, SVDPI
+// configuration only). Keeping them here is what leaves simlog.h free of
+// `<svdpi.h>` and of any simulator declaration, so DPI-C code may include
+// `<vpi_user.h>` / `<veriuser.h>` next to it without the `t_vpi_time` / `VPI_TIME`
+// redefinition trap, and the time functions are weak references in one library
+// instead of in every user translation unit.
 //
 // The split is asymmetric on purpose: SystemC stays header-only, SVDPI is compiled
 // because it exists to be *loaded* by a simulator. Using it means linking this file
@@ -71,7 +73,7 @@
 // never silently applied — the same rule SIMLOG_LEVEL and the time source follow.
 //
 // ── Export list ──────────────────────────────────────────────────────
-// The five `extern "C"` functions below are the ABI: they are marked SIMLOG_EXPORT
+// The six `extern "C"` functions below are the ABI: they are marked SIMLOG_EXPORT
 // (default visibility) so `nm -D libsimlog.so` lists them by name. The header's
 // inline functions are exported weak as usual — that is what lets another DPI-C
 // library that links libsimlog.so share this library's state (the category-4 test
@@ -95,10 +97,11 @@
 #include <svdpi.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 
-// The five entry points below are exported by name (SIMLOG_EXPORT); the header's
+// The six entry points below are exported by name (SIMLOG_EXPORT); the header's
 // inline functions stay weak-exported too, so they can be interposed. On Windows
 // dllexport is what exports them at all.
 #if defined(_WIN32)
@@ -120,13 +123,15 @@
 // redeclaration is what turns the hard link-time dependency into a run-time check.
 // The VPI/PLI ones are declared here instead of including
 // <vpi_user.h>/<veriuser.h>: this file must compile without any simulator include
-// path beyond the header-only `svdpi` package, and only four scalar signatures are
-// involved (svTimeVal *is* VPI's s_vpi_time, PLI_INT32/int32_t is int).
+// path beyond the header-only `svdpi` package, and only the handful of scalar
+// signatures involved are needed (svTimeVal *is* VPI's s_vpi_time, PLI_INT32 is
+// int, and vpi_printf's PLI_INT32 return is int).
 extern "C" {
 SIMLOG_WEAK_SYMBOL int svGetTime(const svScope scope, svTimeVal* time);
 SIMLOG_WEAK_SYMBOL int svGetTimePrecision(const svScope scope, std::int32_t* precision);
 SIMLOG_WEAK_SYMBOL void vpi_get_time(void* object, svTimeVal* time);
 SIMLOG_WEAK_SYMBOL std::int32_t tf_gettimeprecision(void);
+SIMLOG_WEAK_SYMBOL int vpi_printf(const char* format, ...);
 }  // extern "C"
 #endif  // SIMLOG_HAS_WEAK_SYMBOLS
 
@@ -188,6 +193,17 @@ void warn_no_sim_time_once() {
 // shifted back in, not dropped.
 [[nodiscard]] std::uint64_t ticks_of(const svTimeVal& t) noexcept {
   return (static_cast<std::uint64_t>(t.high) << 32) | static_cast<std::uint64_t>(t.low);
+}
+
+// Whether the simulator exports its print routine. Without weak symbols the
+// reference is hard, so a successful link means it is there (same rule as the
+// time functions).
+[[nodiscard]] bool vpi_printf_available() noexcept {
+#if SIMLOG_HAS_WEAK_SYMBOLS
+  return vpi_printf != nullptr;
+#else
+  return true;
+#endif
 }
 
 // Precision exponent → {multiplier, symbol}. The DPI time API reports an exponent
@@ -284,6 +300,7 @@ extern "C" {
 // definition below against them instead of against a half-remembered copy.
 SIMLOG_EXPORT std::uint64_t simlog_sv_now_ticks();
 SIMLOG_EXPORT simlog::detail::unit_scale simlog_sv_resolution_unit();
+SIMLOG_EXPORT void simlog_sv_write(const char* text, std::size_t size);
 
 SIMLOG_EXPORT void* simlog_open(const char* name);
 SIMLOG_EXPORT void simlog_log(void* handle, int level, const char* msg);
@@ -321,6 +338,36 @@ simlog::detail::unit_scale simlog_sv_resolution_unit() {
   if (read_vpi_precision(exponent)) return unit_for_precision(exponent);
   warn_no_sim_time_once();
   return {1, "s"};
+}
+
+// ── The default sink's writer ────────────────────────────────────────
+// A DPI-C library is an ordinary shared object: its stdout is the C runtime's
+// stream, and `simv -l sim.log` does not see it, so a testbench's C++ log lines
+// would be missing from the simulation log. The simulator's own print routine is
+// the stream -l duplicates into the file and $display goes through, so the
+// default sink (simlog.h) formats the line and hands it here:
+//
+//   vpi_printf("%.*s", size, text)      → the simulator's output stream
+//   std::fwrite(text, 1, size, stdout)   → when the host has no VPI at all
+//
+// vpi_printf() is the standard IEEE 1800 VPI routine on purpose: it is what a
+// simulator exports to a DPI-C library, VCS included, and it needs no vendor
+// header. It is declared weak for the same reason the time functions are — a host
+// without a simulator must still load the library and fall back, never fail to
+// link. The line is passed as a "%.*s" argument, never as the format string: a
+// message containing '%' is a message, not a printf template.
+void simlog_sv_write(const char* text, std::size_t size) {
+  if (text == nullptr || size == 0) return;
+  // "%.*s" + the length keeps the line out of the format position.
+  if (vpi_printf_available()) {
+    vpi_printf("%.*s", static_cast<int>(size), text);
+    return;
+  }
+  // No VPI host (a plain host-side program): the C runtime's stdout is then the
+  // only stream there is. Flushed per line so redirecting it to a file behaves
+  // like a simulator's log file.
+  std::fwrite(text, 1, size, stdout);
+  std::fflush(stdout);
 }
 
 // ── The SystemVerilog-facing C ABI ───────────────────────────────────

@@ -65,6 +65,11 @@ together with the SV sources:
 vcs -full64 -sverilog -sv_lib <build-dir>/libsimlog tb.sv   # or pass the .so as a file
 ```
 
+Where the lines end up is part of the backend: the SVDPI default sink prints through the simulator's
+own output routine (`vpi_printf`), so `simv -l sim.log` contains them next to the `$display` lines.
+A DPI-C library's own `printf` would not: `-l` mirrors the simulator's stream, not the C runtime's
+stdout. Without a VPI host (a plain host-side program) the lines go to stdout as before.
+
 | SystemVerilog | C ABI (`libsimlog.so`) | Notes |
 |---|---|---|
 | `new(name)` | `simlog_open(name)` | once per logger; the handle *is* the registered spdlog logger, so two opens of one name are one logger |
@@ -165,7 +170,7 @@ source; categories 3 and 4 exist because the SystemVerilog side is a separate su
 |---|---|---|---|
 | 1 | SystemC backend | [`tests/systemc/tests.cpp`](tests/systemc/tests.cpp) + [`tests/cases.cpp`](tests/cases.cpp) | `xmake test` — 15 scenarios, one process each |
 | 2 | SVDPI, simlog used from C++ | [`tests/svdpi/cpp/`](tests/svdpi/cpp) + the same `cases.cpp` | `xmake run vcs-test` — the shared scenarios assert exact log lines inside C++, the bench only applies `#delay` |
-| 3 | SVDPI, simlog used from SV | [`tests/svdpi/sv/proxy.sv`](tests/svdpi/sv/proxy.sv) | `xmake run vcs-test` — expected lines supplied to the runner and diffed |
+| 3 | SVDPI, simlog used from SV | [`tests/svdpi/sv/proxy.sv`](tests/svdpi/sv/proxy.sv) | `xmake run vcs-test` — expected lines supplied to the runner, diffed against `simv -l sim.log` |
 | 4 | mixed C++ + SV, one logger | [`tests/svdpi/mixed/`](tests/svdpi/mixed) | `xmake run vcs-test` — diffed lines plus a same-entity check |
 
 ```bash

@@ -61,6 +61,10 @@ endmodule
 vcs -full64 -sverilog -sv_lib <build-dir>/libsimlog tb.sv   # 或把 .so 当文件参数传入
 ```
 
+日志行去哪里是后端的一部分：SVDPI 的默认 sink 通过仿真器自己的输出函数（`vpi_printf`）打印，所以
+`simv -l sim.log` 里能和 `$display` 的行一起看到它们。而 DPI-C 库自己的 `printf` 不会进 `-l` 文件：
+`-l` 镜像的是仿真器的输出流，不是 C 运行时的 stdout。没有 VPI 宿主（普通宿主程序）时，行还是走 stdout。
+
 | SystemVerilog | C ABI（`libsimlog.so`） | 说明 |
 |---|---|---|
 | `new(name)` | `simlog_open(name)` | 每个 logger 一次；handle *就是* 已注册的 spdlog logger，所以同名两次 open 是同一个 logger |
@@ -152,7 +156,7 @@ xmake f --backend=svdpi -y     # 切回
 |---|---|---|---|
 | 1 | SystemC 后端 | [`tests/systemc/tests.cpp`](tests/systemc/tests.cpp) + [`tests/cases.cpp`](tests/cases.cpp) | `xmake test` —— 15 个场景，各自独立进程 |
 | 2 | SVDPI，C++ 侧使用 simlog | [`tests/svdpi/cpp/`](tests/svdpi/cpp) + 同一份 `cases.cpp` | `xmake run vcs-test` —— 共享场景在 C++ 中断言精确日志行，bench 只负责 `#delay` |
-| 3 | SVDPI，SV 侧使用 simlog | [`tests/svdpi/sv/proxy.sv`](tests/svdpi/sv/proxy.sv) | `xmake run vcs-test` —— 期望行交给 runner 后逐行 diff |
+| 3 | SVDPI，SV 侧使用 simlog | [`tests/svdpi/sv/proxy.sv`](tests/svdpi/sv/proxy.sv) | `xmake run vcs-test` —— 期望行交给 runner，与 `simv -l sim.log` 逐行 diff |
 | 4 | C++ 与 SV 混用同一 logger | [`tests/svdpi/mixed/`](tests/svdpi/mixed) | `xmake run vcs-test` —— diff 日志行并检查是同一实体 |
 
 ```bash
