@@ -121,8 +121,8 @@ SIMLOG_LEVEL="info"                # 就是全局级别
 
 ## 构建
 
-项目使用 xmake；spdlog（header-only）、svdpi（header-only，即 DPI-C 的 `<svdpi.h>`，只有编译
-`src/simlog.cpp` 时才需要）和 SystemC（共享库，仅 SystemC 后端）都来自 xrepo。
+项目使用 xmake；spdlog（共享库——每个进程只有一个 logger 注册表）、svdpi（header-only，即 DPI-C 的
+`<svdpi.h>`，只有编译 `src/simlog.cpp` 时才需要）和 SystemC（共享库，仅 SystemC 后端）都来自 xrepo。
 
 ```bash
 xmake                          # 默认后端（svdpi）：libsimlog.so，由 include/ + src/ 构建
@@ -137,6 +137,10 @@ xmake f --backend=svdpi -y     # 切回
 后端选项就是同名编译期宏：`--backend=svdpi` 为所有依赖 `simlog` target 的目标定义
 `SIMLOG_BACKEND_SVDPI`，`--backend=systemc` 定义 `SIMLOG_BACKEND_SYSTEMC`。不用 xmake 而直接使用头文
 件的使用方，只需定义其中一个宏，默认后端则什么都不用定义。
+
+`libsimlog.so` 依赖 `libspdlog.so`（NEEDED）：在 xmake 之外（比如仿真器手工加载它）使用时，要确保共
+享 spdlog 可被找到，例如通过 `LD_LIBRARY_PATH`。在 xmake 之内，`xmake run` 和 `xmake test` 会自动注
+入包的 lib 目录。
 
 ## 测试
 

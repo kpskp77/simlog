@@ -132,8 +132,9 @@ SIMLOG_LEVEL="info"                # simply the global level
 
 ## Build
 
-The project uses xmake; spdlog (header-only), svdpi (header-only, the DPI-C `<svdpi.h>`, needed only
-to compile `src/simlog.cpp`) and SystemC (shared library, SystemC backend only) come from xrepo.
+The project uses xmake; spdlog (shared library — one logger registry per process), svdpi
+(header-only, the DPI-C `<svdpi.h>`, needed only to compile `src/simlog.cpp`) and SystemC (shared
+library, SystemC backend only) come from xrepo.
 
 ```bash
 xmake                          # default backend (svdpi): libsimlog.so, built from include/ + src/
@@ -149,6 +150,10 @@ The backend option is the compile-time macro of the same name: `--backend=svdpi`
 `SIMLOG_BACKEND_SVDPI` for everything that depends on the `simlog` target, `--backend=systemc`
 defines `SIMLOG_BACKEND_SYSTEMC`. Consumers that use the header without xmake simply define one
 macro, or nothing at all for the default backend.
+
+`libsimlog.so` is NEEDED on `libspdlog.so`: outside xmake (a simulator loading it by hand), make
+sure the shared spdlog is findable, e.g. via `LD_LIBRARY_PATH`. Under xmake, `xmake run` and
+`xmake test` inject the package lib dir automatically.
 
 ## Tests
 

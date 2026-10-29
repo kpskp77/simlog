@@ -43,11 +43,17 @@ xmake run tests stamp          # run one scenario directly
   time symbols) — say so when reporting.
 - `xmake` runs with `-Wall -Wextra -Werror` on every target; a warning is a build failure, never
   silence one to get green.
-- spdlog (header-only), svdpi (header-only `<svdpi.h>`) and SystemC (shared) come from xrepo via
-  `add_requires`. `add_packages` is per target: `simlog` takes `systemc` publicly only in the
-  SystemC branch, and `svdpi` privately (only `src/simlog.cpp` includes it) only in the SVDPI one.
-- `xmake run` is what injects the SystemC `LD_LIBRARY_PATH`; **never run the SystemC
-  `build/.../example` or `build/.../tests` binaries directly**.
+- spdlog (shared), svdpi (header-only `<svdpi.h>`) and SystemC (shared) come from xrepo via
+  `add_requires`. The spdlog registry must live in exactly one `libspdlog.so` per process, so the
+  require is `header_only = false, shared = true` — `shared = true` alone is silently ignored,
+  because the package defaults to `header_only` and then installs no library at all (that
+  misconfiguration gives every DSO its own registry again). `add_packages` is per target: `simlog`
+  takes `spdlog` publicly in both branches, `systemc` publicly only in the SystemC branch, and
+  `svdpi` privately (only `src/simlog.cpp` includes it) only in the SVDPI one.
+- `xmake run` / `xmake test` inject the shared packages' lib dirs into `LD_LIBRARY_PATH` (SystemC
+  and spdlog alike, and the VCS runners through `xmake run`); **never run the SystemC
+  `build/.../example` or `build/.../tests` binaries directly**. Outside xmake, make sure
+  `libspdlog.so` is findable (e.g. `LD_LIBRARY_PATH`) when a simulator loads `libsimlog.so`.
 - A harmless `warning: Ascend SDK not found` appears on this machine; ignore it. The first SystemC
   build is slow, later builds are seconds.
 
@@ -98,9 +104,10 @@ time source, 3 `%*` flag/formatter/default sink, 4 `get()`. Keep new code in the
   handle, level outside 0 … 5, null message) once on stderr while dropping the line.
 - **`include/simlog/` keeps exactly one file.** The SVDPI backend is one file (`src/simlog.cpp`) with
   declarations first and definitions after, so no new header is needed anywhere.
-- **One shared object is one library state** (registry, default sink, `SIMLOG_LEVEL` snapshot): load
+- **One shared object is one library state** (default sink, `SIMLOG_LEVEL` snapshot): load
   `libsimlog.so` or compile `src/simlog.cpp` into the DPI-C library, never both — that would give
-  two loggers per name.
+  two loggers per name. The logger registry itself lives in the shared `libspdlog.so`, one per
+  process, which is exactly what lets separate DSOs meet at one registry.
 - **`sv/simlog_pkg.sv` adds no semantics**: no level filtering, no timestamps, no name guessing. The
   name is explicit (`new($sformatf("%m"))` is the module-level idiom) and `svGetScope()` is not used
   at all.
@@ -235,9 +242,10 @@ stylua xmake.lua
   compile-time switch.
 - **`libsimlog.so` must keep its five entry points exported and its time symbols unresolved.**
   `SIMLOG_EXPORT` (default visibility) is what makes `nm -D` list `simlog_open` / `simlog_log` /
-  `simlog_flush` / `simlog_sv_now_ticks` / `simlog_sv_resolution_unit`. The header's inline functions
-  (notably `simlog::get`) stay weak-exported on purpose: category 4's library links `libsimlog.so`
-  and shares its spdlog registry by interposition, so hiding them breaks that test. The four
+  `simlog_flush` / `simlog_sv_now_ticks` / `simlog_sv_resolution_unit`. The spdlog registry lives
+  in the shared `libspdlog.so`: category 4's single-entity check passes only because every DSO
+  links that same shared package; reverting spdlog to header-only gives each DSO its own registry
+  again and breaks the test. The four
   simulator time functions must stay **weak undefined** (`w` in `nm -D`): never link a simulator
   library, never add `--no-undefined`. **C linkage is name-only**, so the names in `src/simlog.cpp`
   and `sv/simlog_pkg.sv` must be kept in step by hand — a renamed function still links and corrupts

@@ -13,7 +13,11 @@ option("backend", function()
 end)
 
 -- Top-level on purpose: add_requires is not allowed after option/target blocks here.
-add_requires("spdlog", { configs = { header_only = true } })
+-- Shared on purpose: the spdlog logger registry must live in one place per
+-- process (libspdlog.so), not one copy per shared object. header_only must be
+-- false or the package silently stays header-only and every DSO keeps its own
+-- registry again.
+add_requires("spdlog", { configs = { header_only = false, shared = true } })
 if get_config("backend") == "systemc" then
   add_requires("systemc", { configs = { shared = true } })
 else
@@ -32,6 +36,10 @@ target("simlog", function()
     add_defines("SIMLOG_BACKEND_SYSTEMC", { public = true })
     add_packages("systemc", { public = true })
   else
+    -- Always shared, never a static archive and never get_config("kind"): the
+    -- built-in kind config defaults to static, and DPI-C must load this as a
+    -- shared object — a static archive would duplicate the bridge and its
+    -- state into every consumer (two loggers per name again).
     set_kind("shared")
     add_defines("SIMLOG_BACKEND_SVDPI", { public = true })
     add_files("src/simlog.cpp")
