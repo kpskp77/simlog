@@ -142,11 +142,31 @@ xmake f --backend=svdpi -y     # 切回
 
 后端选项即同名的编译期宏：`--backend=svdpi` 为所有依赖 `simlog` 目标的构建目标定义
 `SIMLOG_BACKEND_SVDPI`，`--backend=systemc` 则定义 `SIMLOG_BACKEND_SYSTEMC`。不使用 xmake、直接包含
-头文件的用户只需定义其中一个宏；使用默认后端时无需任何定义。
+头文件的用户只需定义其中一个宏；使用默认后端时无需任何定义——或者，在 xmake 内直接使用
+[`eda` 仓库中的包](#在其他项目中集成-simlog)。
 
 `libsimlog.so` 依赖（NEEDED）`libspdlog.so`：在 xmake 之外使用（例如由仿真器手工加载）时，需确保
 共享版 spdlog 可被找到，可借助 `LD_LIBRARY_PATH`。在 xmake 内，`xmake run` 与 `xmake test` 会
 自动注入各包的 lib 目录。
+
+## 在其他项目中集成 simlog
+
+simlog 已收录到 [EDA xmake 包仓库](https://github.com/kpskp77/xmake-repo)。注册该仓库并 require 该包，
+集成就完成了：
+
+```lua
+add_repositories("eda https://github.com/kpskp77/xmake-repo.git")
+
+add_requires("simlog")  -- 默认 SVDPI 后端：头文件 + libsimlog.so + SV 侧的 C ABI
+-- add_requires("simlog 1.0.0")                                   -- 固定版本
+-- add_requires("simlog", { configs = { backend = "systemc" } })  -- SystemC 后端（header-only）
+
+target("tb")
+  set_kind("shared")      -- 由仿真器加载的 DPI-C 库：不能是可执行文件，也不能是静态库
+  set_languages("c++17")  -- 头文件的最低要求
+  add_files("src/*.cpp")
+  add_packages("simlog", { public = true })
+```
 
 ## 测试
 

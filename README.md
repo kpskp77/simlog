@@ -154,11 +154,32 @@ xmake f --backend=svdpi -y     # switch back
 The backend option is the compile-time macro of the same name: `--backend=svdpi` defines
 `SIMLOG_BACKEND_SVDPI` for everything that depends on the `simlog` target, `--backend=systemc`
 defines `SIMLOG_BACKEND_SYSTEMC`. Consumers that use the header without xmake simply define one
-macro, or nothing at all for the default backend.
+macro, or nothing at all for the default backend — or, inside xmake, take the package from
+[the `eda` repository](#using-simlog-from-another-project).
 
 `libsimlog.so` is NEEDED on `libspdlog.so`: outside xmake (a simulator loading it by hand), make
 sure the shared spdlog is findable, e.g. via `LD_LIBRARY_PATH`. Under xmake, `xmake run` and
 `xmake test` inject the package lib dir automatically.
+
+## Using simlog from another project
+
+simlog is published in the [EDA xmake package repository](https://github.com/kpskp77/xmake-repo)
+. Register that repository once and require the package — that is the whole
+integration:
+
+```lua
+add_repositories("eda https://github.com/kpskp77/xmake-repo.git")
+
+add_requires("simlog")  -- default SVDPI backend: headers + libsimlog.so + the SV-facing C ABI
+-- add_requires("simlog 1.0.0")                                   -- pin a version
+-- add_requires("simlog", { configs = { backend = "systemc" } })  -- SystemC backend (header-only)
+
+target("tb")
+  set_kind("shared")      -- a DPI-C library the simulator loads: never an executable, never static
+  set_languages("c++17")  -- the header's floor
+  add_files("src/*.cpp")
+  add_packages("simlog", { public = true })
+```
 
 ## Tests
 
