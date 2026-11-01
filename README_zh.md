@@ -8,7 +8,7 @@
 | 后端 | 宏 | 仿真时间来源 | 依赖 |
 |---|---|---|---|
 | **SVDPI**（默认） | `SIMLOG_BACKEND_SVDPI` | DPI 时间 API `svGetTime()` / `svGetTimePrecision()`（IEEE 1800-2023）；旧版仿真器上回退到 `vpi_get_time()` / `tf_gettimeprecision()` | spdlog + `libsimlog.so`（编译型后端，实现在 `src/simlog.cpp`） |
-| SystemC | `SIMLOG_BACKEND_SYSTEMC` | `sc_time_stamp()` × `sc_get_time_resolution()` | spdlog + SystemC（header-only） |
+| SystemC | `SIMLOG_BACKEND_SYSTEMC` | `sc_time_stamp()` × `sc_get_time_resolution()` | spdlog + SystemC，编译进 `libsimlog.so` |
 
 - **无需自定义 logger 类型**：`simlog::get()` 返回原生 `spdlog::logger`，`add_sink` / `set_level` 照常可用
 
@@ -128,21 +128,25 @@ SIMLOG_LEVEL="info"                # 仅设置全局级别
 
 项目使用 xmake；spdlog（共享库——整个进程只有一个 logger 注册表）、svdpi（header-only，提供 DPI-C 的
 `<svdpi.h>`，仅在编译 `src/simlog.cpp` 时需要）与 SystemC（共享库，仅 SystemC 后端需要）均来自
-xrepo。
+xrepo。公共头文件只声明一个函数 `simlog::get()`；其余实现——时间源、`%*` flag、默认 sink、
+`SIMLOG_LEVEL` 规则——在两个后端下都编译进由 `src/simlog.cpp` 构建的 `libsimlog.so`，
+因此头文件不需要任何仿真器或 SystemC 的 include 路径。
 
 ```bash
 xmake                          # 默认后端（svdpi）：libsimlog.so，由 include/ + src/ 构建
 xmake run example              # 用 VCS 编译并运行 examples/svdpi/tb.sv；没有 vcs 时跳过
 xmake run vcs-test             # 在真实仿真器（VCS）中运行 category 2-4；没有 vcs 时跳过
 xmake f --backend=systemc -y   # 切换到 SystemC 后端
+xmake                          # 同样是 libsimlog.so——这次编译进去的是 SystemC 后端
 xmake run example              # SystemC 示例，6 行文档输出
 xmake test                     # 单元测试——仅 SystemC 配置
 xmake f --backend=svdpi -y     # 切回
 ```
 
-后端选项即同名的编译期宏：`--backend=svdpi` 为所有依赖 `simlog` 目标的构建目标定义
-`SIMLOG_BACKEND_SVDPI`，`--backend=systemc` 则定义 `SIMLOG_BACKEND_SYSTEMC`。不使用 xmake、直接包含
-头文件的用户只需定义其中一个宏；使用默认后端时无需任何定义——或者，在 xmake 内直接使用
+后端选项即同名的编译期宏，在把 `src/simlog.cpp` 编译进 `libsimlog.so` 时生效：
+`--backend=svdpi` 为所有依赖 `simlog` 目标的构建目标定义 `SIMLOG_BACKEND_SVDPI`，
+`--backend=systemc` 则定义 `SIMLOG_BACKEND_SYSTEMC`。包含头文件的代码完全不需要任何定义；手工构建
+该库则是用其中一个宏（默认后端可不定义）编译 `src/simlog.cpp`——或者，在 xmake 内直接使用
 [`eda` 仓库中的包](#在其他项目中集成-simlog)。
 
 `libsimlog.so` 依赖（NEEDED）`libspdlog.so`：在 xmake 之外使用（例如由仿真器手工加载）时，需确保
@@ -159,7 +163,7 @@ add_repositories("eda https://github.com/kpskp77/xmake-repo.git")
 
 add_requires("simlog")  -- 默认 SVDPI 后端：头文件 + libsimlog.so + SV 侧的 C ABI
 -- add_requires("simlog 1.0.0")                                   -- 固定版本
--- add_requires("simlog", { configs = { backend = "systemc" } })  -- SystemC 后端（header-only）
+-- add_requires("simlog", { configs = { backend = "systemc" } })  -- SystemC 后端
 
 target("tb")
   set_kind("shared")      -- 由仿真器加载的 DPI-C 库：不能是可执行文件，也不能是静态库

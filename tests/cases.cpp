@@ -19,24 +19,33 @@
 #include <utility>
 
 #include "check.h"
+// White-box declarations of the detail functions this suite exercises (the
+// public header exposes only simlog::get()).
+#include "simlog_detail.h"
 
 namespace test::cases {
 namespace {
 
 constexpr const char* kLogger = "tb";
 
-// Format one message through the library's formatter, without a sink, and
-// return the line with its line ending removed.
-std::string render(std::string_view payload, std::string_view logger = kLogger,
-                   spdlog::level::level_enum level = spdlog::level::info) {
-  const auto formatter = simlog::detail::make_sim_formatter();
+// Format one message through a given formatter, without a sink, and return the
+// line with its line ending removed.
+std::string render_with(spdlog::formatter& formatter, std::string_view payload,
+                        std::string_view logger = kLogger,
+                        spdlog::level::level_enum level = spdlog::level::info) {
   const spdlog::details::log_msg msg(spdlog::string_view_t(logger.data(), logger.size()), level,
                                      spdlog::string_view_t(payload.data(), payload.size()));
   spdlog::memory_buf_t buf;
-  formatter->format(msg, buf);
+  formatter.format(msg, buf);
   std::string line(buf.data(), buf.size());
   while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
   return line;
+}
+
+// Format one message through the library's own formatter, without a sink.
+std::string render(std::string_view payload, std::string_view logger = kLogger,
+                   spdlog::level::level_enum level = spdlog::level::info) {
+  return render_with(*simlog::detail::make_sim_formatter(), payload, logger, level);
 }
 
 // ── format: %* rendering, no logger involved ─────────────────────────
@@ -62,10 +71,15 @@ std::uint64_t format_step(const context& ctx, unsigned phase) {
   CHECK_EQ(simlog::detail::now_ticks(), std::uint64_t{12340});
   CHECK_EQ(render("after start"), expect_line(12340, ctx.base, "tb", "info", "after start"));
 
-  // spdlog clones custom flags, so the flag must be independently copyable.
-  const simlog::detail::sim_time_flag flag;
-  const std::unique_ptr<spdlog::custom_flag_formatter> clone = flag.clone();
+  // spdlog clones custom flags inside pattern_formatter::clone(), so cloning
+  // the whole formatter proves the %* flag is independently copyable — and that
+  // the clone still carries a working flag.
+  const auto formatter = simlog::detail::make_sim_formatter();
+  const std::unique_ptr<spdlog::formatter> clone = formatter->clone();
   CHECK(clone != nullptr);
+  if (clone) {
+    CHECK_EQ(render_with(*clone, "cloned"), expect_line(12340, ctx.base, "tb", "info", "cloned"));
+  }
   return 0;
 }
 

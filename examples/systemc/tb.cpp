@@ -4,6 +4,8 @@
 // counterpart (its own six lines, at 1 ps simulation resolution).
 #include <simlog/simlog.h>
 
+#include <systemc>  // sc_main / sc_core — simlog.h no longer pulls it in
+
 // sc_main is invoked by libsystemc, so it must stay exported if the program is
 // ever built with hidden default visibility.
 #if defined(_WIN32)

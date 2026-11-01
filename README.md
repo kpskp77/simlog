@@ -8,7 +8,7 @@ inside an EDA simulation, from one of two compile-time backends:
 | Backend | Macro | Simulation time comes from | Needs |
 |---|---|---|---|
 | **SVDPI** (default) | `SIMLOG_BACKEND_SVDPI` | the DPI time API `svGetTime()` / `svGetTimePrecision()` (IEEE 1800-2023), or on older simulators `vpi_get_time()` / `tf_gettimeprecision()` | spdlog + `libsimlog.so` (compiled backend: `src/simlog.cpp`) |
-| SystemC | `SIMLOG_BACKEND_SYSTEMC` | `sc_time_stamp()` × `sc_get_time_resolution()` | spdlog + SystemC (header-only) |
+| SystemC | `SIMLOG_BACKEND_SYSTEMC` | `sc_time_stamp()` × `sc_get_time_resolution()` | spdlog + SystemC, compiled into `libsimlog.so` |
 
 - **No custom logger type**: `simlog::get()` returns a native `spdlog::logger`, so `add_sink` /
   `set_level` work as usual
@@ -139,23 +139,28 @@ SIMLOG_LEVEL="info"                # simply the global level
 
 The project uses xmake; spdlog (shared library — one logger registry per process), svdpi
 (header-only, the DPI-C `<svdpi.h>`, needed only to compile `src/simlog.cpp`) and SystemC (shared
-library, SystemC backend only) come from xrepo.
+library, SystemC backend only) come from xrepo. The public header declares a single function,
+`simlog::get()`; everything else — the time source, the `%*` flag, the default sink, the
+`SIMLOG_LEVEL` rules — is compiled into `libsimlog.so` from `src/simlog.cpp`, for both backends, so
+the header needs no simulator or SystemC include path.
 
 ```bash
 xmake                          # default backend (svdpi): libsimlog.so, built from include/ + src/
 xmake run example              # compile + run examples/svdpi/tb.sv in VCS; skips without vcs
 xmake run vcs-test             # categories 2-4 in a real simulator (VCS); skips without vcs
 xmake f --backend=systemc -y   # switch to the SystemC backend
+xmake                          # libsimlog.so again — the SystemC backend compiled in this time
 xmake run example              # the SystemC example, 6 documented lines
 xmake test                     # the unit suite — SystemC configuration only
 xmake f --backend=svdpi -y     # switch back
 ```
 
-The backend option is the compile-time macro of the same name: `--backend=svdpi` defines
-`SIMLOG_BACKEND_SVDPI` for everything that depends on the `simlog` target, `--backend=systemc`
-defines `SIMLOG_BACKEND_SYSTEMC`. Consumers that use the header without xmake simply define one
-macro, or nothing at all for the default backend — or, inside xmake, take the package from
-[the `eda` repository](#using-simlog-from-another-project).
+The backend option is the compile-time macro of the same name, defined when `src/simlog.cpp` is
+compiled into `libsimlog.so`: `--backend=svdpi` defines `SIMLOG_BACKEND_SVDPI` for everything that
+depends on the `simlog` target, `--backend=systemc` defines `SIMLOG_BACKEND_SYSTEMC`. Code that
+includes the header never needs a define at all; building the library by hand means compiling
+`src/simlog.cpp` with one of the macros — or nothing, for the default backend — or, inside xmake,
+take the package from [the `eda` repository](#using-simlog-from-another-project).
 
 `libsimlog.so` is NEEDED on `libspdlog.so`: outside xmake (a simulator loading it by hand), make
 sure the shared spdlog is findable, e.g. via `LD_LIBRARY_PATH`. Under xmake, `xmake run` and
@@ -172,7 +177,7 @@ add_repositories("eda https://github.com/kpskp77/xmake-repo.git")
 
 add_requires("simlog")  -- default SVDPI backend: headers + libsimlog.so + the SV-facing C ABI
 -- add_requires("simlog 1.0.0")                                   -- pin a version
--- add_requires("simlog", { configs = { backend = "systemc" } })  -- SystemC backend (header-only)
+-- add_requires("simlog", { configs = { backend = "systemc" } })  -- SystemC backend
 
 target("tb")
   set_kind("shared")      -- a DPI-C library the simulator loads: never an executable, never static

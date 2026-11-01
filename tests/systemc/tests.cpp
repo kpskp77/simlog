@@ -17,9 +17,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <string_view>
+#include <systemc>  // sc_main / sc_core — simlog.h no longer pulls it in
 
 #include "cases.h"
 #include "check.h"
+// White-box declarations of the detail functions the resolution scenarios read
+// (the public header exposes only simlog::get()).
+#include "simlog_detail.h"
 
 // sc_main is called by the SystemC kernel, so it has to stay exported even if the
 // program is ever built with hidden default visibility.

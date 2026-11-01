@@ -24,25 +24,28 @@ else
   add_requires("svdpi")
 end
 
--- One target, one backend: header-only for SystemC, libsimlog.so for SVDPI. src/simlog.cpp
--- is compiled exactly once, here.
+-- One target, one backend, always shared: libsimlog.so is one library state
+-- (default sink, SIMLOG_LEVEL snapshot, the SV bridge) no matter the backend,
+-- and the SystemC backend's time source is compiled here exactly like the
+-- SVDPI one. src/simlog.cpp is compiled exactly once, here, never into a test
+-- or example target. Never a static archive and never get_config("kind"): the
+-- built-in kind config defaults to static, and both backends need one shared
+-- object per process (two copies would be two loggers per name again).
 target("simlog", function()
+  set_kind("shared")
   set_warnings("all", "extra", "error")
   add_headerfiles("include/(simlog/*.h)")
   add_includedirs("include", { public = true })
+  add_files("src/simlog.cpp")
+  -- Private: the dllexport side of SIMLOG_API on Windows; consumers must not
+  -- inherit it.
+  add_defines("SIMLOG_BUILD")
   add_packages("spdlog", { public = true })
   if get_config("backend") == "systemc" then
-    set_kind("headeronly")
     add_defines("SIMLOG_BACKEND_SYSTEMC", { public = true })
     add_packages("systemc", { public = true })
   else
-    -- Always shared, never a static archive and never get_config("kind"): the
-    -- built-in kind config defaults to static, and DPI-C must load this as a
-    -- shared object — a static archive would duplicate the bridge and its
-    -- state into every consumer (two loggers per name again).
-    set_kind("shared")
     add_defines("SIMLOG_BACKEND_SVDPI", { public = true })
-    add_files("src/simlog.cpp")
     add_packages("svdpi")
   end
 end)

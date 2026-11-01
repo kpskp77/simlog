@@ -1,8 +1,11 @@
 // Backend-agnostic test scenarios, shared by the SystemC and SVDPI suites.
 //
-// The scenario bodies below only use simlog's public contract (simlog::get(),
-// the %* flag, SIMLOG_LEVEL, the spdlog registry). They never touch the SystemC
-// kernel and never hand a timestamp to anything: time is advanced by the host,
+// The scenario bodies below use simlog's public contract (simlog::get(), the %*
+// flag, SIMLOG_LEVEL, the spdlog registry) plus the white-box detail functions
+// declared in simlog_detail.h (the time source, the env parser, the default
+// sink) — the public header exposes only simlog::get(). They never touch the
+// SystemC kernel and never hand a timestamp to anything: time is advanced by the
+// host,
 // because only the host knows how:
 //
 //   SystemC  tests/systemc/tests.cpp advances sc_time between phases
