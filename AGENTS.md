@@ -300,9 +300,11 @@ stylua xmake.lua
 - **Switching the backend needs a reconfigure** (`xmake f --backend=… -y`), and the two
   configurations do not share a test entry point (`xmake test` is SystemC only, `xmake run vcs-test`
   is SVDPI only), so a green run of one says nothing about the other.
-- The `svdpi` package lives in the local `myrepo` xmake repository and must stay a **top-level**
-  `add_requires("svdpi")` (this xmake version rejects it after `option`/`target` blocks). Do not
-  replace it with a simulator include path.
+- The `svdpi` package lives in the local `myrepo` xmake repository and `add_requires("svdpi")`
+  must stay **top-level** — outside any `option`/`target` callback, which this xmake version
+  rejects. It deliberately sits *after* the `backend` option: `get_config("backend")` guards it,
+  so each backend pulls in only its own time-source package (`systemc` vs `svdpi`, never both).
+  Do not replace it with a simulator include path.
 - The `tests` target has `set_default(false)`: `xmake` alone does not build it — `xmake test` does.
 - `build/` and `.xmake/` are git-ignored; never commit or hand-edit them, and never edit generated
   files to make a test pass.
